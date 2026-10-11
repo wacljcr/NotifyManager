@@ -2193,12 +2193,17 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     [_spinner startAnimating];
     _keyField.enabled = NO;
     
-    NSString *urlStr = [NSString stringWithFormat:@"http://101.200.189.251/verify.php?key=%@&udid=%@",
-                        [newKey stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]],
-                        [udidStr  stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
-    NSURLRequest *req = [NSURLRequest requestWithURL:[NSURL URLWithString:urlStr]
-                                         cachePolicy:NSURLRequestReloadIgnoringLocalAndRemoteCacheData
-                                     timeoutInterval:10];
+    // 旧 API: POST verify.php  action=verify&key=X&device_id=X&tweak_id=X
+    NSString *body = [NSString stringWithFormat:
+        @"action=verify&key=%@&device_id=%@&tweak_id=com.ntm.notifymanager",
+        [newKey   stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]],
+        [udidStr  stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"http://101.200.189.251/verify.php"]];
+    req.HTTPMethod = @"POST";
+    req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
+    [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+    req.timeoutInterval = 10;
+    
     NSURLResponse *resp = nil; NSError *err = nil;
     NSData *data = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:&err];
     
@@ -2213,41 +2218,26 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     NSError *je = nil;
     id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&je];
     if (je || ![json isKindOfClass:[NSDictionary class]]) {
-        [self flashError:@"服务器返回异常"];
+        NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+        [self flashError:[NSString stringWithFormat:@"服务器返回异常：%@", raw.length > 50 ? [raw substringToIndex:50] : raw]];
         return;
     }
     
-    BOOL ok = [json[@"ok"] boolValue];
-    BOOL valid = [json[@"valid"] boolValue];
-    if (!ok || !valid) {
-        NSString *reason = json[@"reason"] ?: @"未知";
-        NSString *msg;
-        if ([reason isEqualToString:@"invalid"]) msg = @"❌ 卡密无效";
-        else if ([reason isEqualToString:@"expired"]) msg = @"❌ 卡密已过期";
-        else if ([reason isEqualToString:@"udid_mismatch"]) msg = @"❌ 此卡密已绑定其他设备";
-        else if ([reason isEqualToString:@"missing_key"]) msg = @"❌ 卡密为空";
-        else msg = [NSString stringWithFormat:@"❌ 验证失败：%@", reason];
+    BOOL authorized = [json[@"authorized"] boolValue];
+    NSString *message = json[@"message"] ?: @"";
+    
+    if (!authorized) {
+        NSString *msg = [NSString stringWithFormat:@"❌ %@", message.length ? message : @"验证失败"];
         [self flashError:msg];
         return;
     }
     
-    // OK!
+    // OK! 旧 API 没给 expires，我们给 30 天（+7 缓冲 = 37 天）
     NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"com.ntm.notifymanager"];
     [d setObject:newKey forKey:@"NTM_activation_key"];
     [d setObject:udidStr forKey:@"NTM_verify_udid"];
-    
-    NSString *expStr = json[@"expires"];
-    NSDate *expDate = nil;
-    if (expStr && ![expStr isEqualToString:@"永久"]) {
-        static NSDateFormatter *fm = nil;
-        if (!fm) { fm = [[NSDateFormatter alloc] init]; fm.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"]; }
-        fm.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-        expDate = [fm dateFromString:expStr];
-        if (expDate) expDate = [expDate dateByAddingTimeInterval:7*86400];
-    } else {
-        expDate = [NSDate dateWithTimeIntervalSinceNow:365*86400];
-    }
-    if (expDate) [d setObject:expDate forKey:@"NTM_verify_expires"];
+    NSDate *expDate = [NSDate dateWithTimeIntervalSinceNow:(30+7)*86400];
+    [d setObject:expDate forKey:@"NTM_verify_expires"];
     [d synchronize];
     
     CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(),

@@ -632,50 +632,39 @@ __attribute__((constructor)) static void init() {
                                         CFSTR("com.ntm.notifymanager.activationChanged"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         
-        // 如果没验证通过，发异步请求验证服务器（不阻塞启动）
+        // 如果没验证通过，发异步请求验证服务器（不阻塞启动）— 旧 API
         if (!verified && savedKey.length) {
             NSString *udidStr = udid ?: @"";
-            NSString *paramKey = [savedKey stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
-            NSString *paramUdid = [udidStr stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
-            NSString *urlStr = [NSString stringWithFormat:@"http://101.200.189.251/verify.php?key=%@&udid=%@", paramKey, paramUdid];
-            NSURL *vurl = [NSURL URLWithString:urlStr];
-            if (vurl) {
-                NSMutableURLRequest *vreq = [NSMutableURLRequest requestWithURL:vurl];
-                vreq.timeoutInterval = 8;
-                [NSURLConnection sendAsynchronousRequest:vreq queue:[NSOperationQueue mainQueue]
-                                      completionHandler:^(NSURLResponse *resp, NSData *data, NSError *err) {
-                    if (!err && data) {
-                        @try {
-                            id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-                            if ([json isKindOfClass:[NSDictionary class]] && [json[@"valid"] boolValue]) {
-                                NSUserDefaults *dd = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
-                                if (json[@"expires"]) {
-                                    // 服务器返回了过期时间，加 7 天宽限期作为缓存
-                                    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
-                                    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-                                    NSDate *ed = [fmt dateFromString:json[@"expires"]];
-                                    if (!ed) fmt.dateFormat = @"yyyy-MM-dd";
-                                    ed = ed ?: [fmt dateFromString:json[@"expires"]];
-                                    if (ed) [dd setObject:[ed dateByAddingTimeInterval:7*86400] forKey:@"NTM_verify_expires"];
-                                }
-                                if (![dd objectForKey:@"NTM_verify_expires"]) {
-                                    [dd setObject:[[NSDate date] dateByAddingTimeInterval:7*86400] forKey:@"NTM_verify_expires"];
-                                }
-                                [dd setObject:udidStr forKey:@"NTM_verify_udid"];
-                                [dd synchronize];
-                                // 通知设置面板刷新状态
-                                CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                    CFSTR("com.ntm.notifymanager.verifyResult"), NULL,
-                                    (__bridge CFDictionaryRef)@{@"valid": @YES}, YES);
-                            } else {
-                                CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                    CFSTR("com.ntm.notifymanager.verifyResult"), NULL,
-                                    (__bridge CFDictionaryRef)@{@"valid": @NO}, YES);
-                            }
-                        } @catch (NSException *e) {}
-                    }
-                }];
-            }
+            NSString *body = [NSString stringWithFormat:
+                @"action=verify&key=%@&device_id=%@&tweak_id=com.ntm.notifymanager",
+                savedKey, udidStr];
+            NSMutableURLRequest *vreq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"http://101.200.189.251/verify.php"]];
+            vreq.HTTPMethod = @"POST";
+            vreq.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
+            [vreq setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+            vreq.timeoutInterval = 8;
+            [NSURLConnection sendAsynchronousRequest:vreq queue:[NSOperationQueue mainQueue]
+                                  completionHandler:^(NSURLResponse *resp, NSData *data, NSError *err) {
+                if (!err && data) {
+                    @try {
+                        id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                        if ([json isKindOfClass:[NSDictionary class]] && [json[@"authorized"] boolValue]) {
+                            NSUserDefaults *dd = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
+                            // 旧 API 没给 expires，存 37 天（30+7缓冲）
+                            [dd setObject:[[NSDate date] dateByAddingTimeInterval:(30+7)*86400] forKey:@"NTM_verify_expires"];
+                            [dd setObject:udidStr forKey:@"NTM_verify_udid"];
+                            [dd synchronize];
+                            CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                CFSTR("com.ntm.notifymanager.verifyResult"), NULL,
+                                (__bridge CFDictionaryRef)@{@"valid": @YES}, YES);
+                        } else {
+                            CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                CFSTR("com.ntm.notifymanager.verifyResult"), NULL,
+                                (__bridge CFDictionaryRef)@{@"valid": @NO}, YES);
+                        }
+                    } @catch (NSException *e) {}
+                }
+            }];
         }
         
         // 未验证通过 → 跳过所有 hooks（功能等于没装）
