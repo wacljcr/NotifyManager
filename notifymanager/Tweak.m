@@ -598,7 +598,22 @@ static void NTM_scheduleMirror(void) {
 
 __attribute__((constructor)) static void init() {
     @autoreleasepool {
-        fprintf(stderr, "[NTM] ===== init() start =====");
+        // 暴力 marker 文件！让 ssh 直接 ls /tmp/ntm_* 看 init() 到底跑了什么
+        // 文件名带进程名后缀，SpringBoard = /tmp/ntm_SpringBoard_*
+        NSString *procName = [NSString stringWithUTF8String:NSProcessInfo.processInfo.processName.UTF8String ?: "unknown"];
+        NSString *prefix = [NSString stringWithFormat:@"/tmp/ntm_%@", procName];
+        NSFileManager *fm = NSFileManager.defaultManager;
+        
+        // 清理旧 marker（上次启动的）
+        [fm removeItemAtPath:[prefix stringByAppendingString:@"_start"] error:nil];
+        [fm removeItemAtPath:[prefix stringByAppendingString:@"_yes"] error:nil];
+        [fm removeItemAtPath:[prefix stringByAppendingString:@"_no"] error:nil];
+        [fm removeItemAtPath:[prefix stringByAppendingString:@"_hooked"] error:nil];
+        
+        // 写 init start marker
+        [fm createFileAtPath:[prefix stringByAppendingString:@"_start"] contents:nil attributes:nil];
+        fprintf(stderr, "[NTM] ===== init() start [%s] =====", procName.UTF8String);
+        
         // ===== 卡密验证（2.3.24 新增）=====
         NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
         NSString *savedKey = [d stringForKey:@"NTM_activation_key"];
@@ -684,6 +699,10 @@ __attribute__((constructor)) static void init() {
         }
         
         fprintf(stderr, "[NTM] ===== final verified=%d =====", verified);
+        
+        // 写 yes/no marker（暴力调试）
+        NSString *markerPath = [prefix stringByAppendingString:(verified ? @"_yes" : @"_no")];
+        [fm createFileAtPath:markerPath contents:nil attributes:nil];
         
         // 未验证通过 → 跳过所有 hooks（功能等于没装）
         // 但注册 configChanged/mirrorUpdated 通知（设置面板还能用）
@@ -799,5 +818,9 @@ __attribute__((constructor)) static void init() {
         tryHookMeta(objc_getClass("SBUserNotificationCenter"),
                     sel_registerName("dispatchUserNotification:flags:replyPort:auditToken:"),
                     (IMP)hook_dispatch, (IMP *)&orig_dispatch);
+        
+        // hook 全装完，写 marker
+        [fm createFileAtPath:[prefix stringByAppendingString:@"_hooked"] contents:nil attributes:nil];
+        fprintf(stderr, "[NTM] ===== ALL hooks installed =====");
     }
 }
