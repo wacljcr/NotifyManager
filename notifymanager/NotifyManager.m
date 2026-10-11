@@ -2005,11 +2005,27 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     udidTitle.textColor = [UIColor colorWithRed:0.30 green:0.30 blue:0.35 alpha:1];
     [udidBox addSubview:udidTitle];
     
+    // 读 UDID：多种 fallback
+    NSString *udidStr = @"";
     void *mg = dlopen("/System/Library/PrivateFrameworks/MobileGestalt.framework/MobileGestalt", RTLD_NOW);
-    NSString *(*copyAns)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
-    NSString *udidStr = copyAns ? copyAns(@"UniqueDeviceID", nil) : @"";
-    dlclose(mg);
-    
+    if (mg) {
+        NSString *(*copyAns)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
+        if (copyAns) {
+            udidStr = copyAns(@"UniqueDeviceID", nil) ?: @"";
+            if (udidStr.length < 20) {
+                NSString *idfv = copyAns(@"IdentifierForVendor", nil) ?: @"";
+                if (idfv.length > udidStr.length) udidStr = idfv;
+            }
+            if (udidStr.length < 20) {
+                NSString *serial = copyAns(@"SerialNumber", nil) ?: @"";
+                if (serial.length > udidStr.length) udidStr = serial;
+            }
+        }
+        dlclose(mg);
+    }
+    if (udidStr.length < 10) {
+        udidStr = [UIDevice currentDevice].identifierForVendor.UUIDString ?: @"";
+    }
     _udidLabel = [[UILabel alloc] init];
     _udidLabel.translatesAutoresizingMaskIntoConstraints = NO;
     _udidLabel.text = udidStr.length > 0 ? udidStr : @"（读不到）";
@@ -2152,10 +2168,27 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     NSString *newKey = [_keyField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
     if (newKey.length == 0) return;
     
+    // 读 UDID fallback（和 viewDidLoad 里的逻辑一致）
+    NSString *udidStr = @"";
     void *mg = dlopen("/System/Library/PrivateFrameworks/MobileGestalt.framework/MobileGestalt", RTLD_NOW);
-    NSString *(*copyAns)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
-    NSString *udidStr = copyAns ? copyAns(@"UniqueDeviceID", nil) : @"";
-    dlclose(mg);
+    if (mg) {
+        NSString *(*copyAns)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
+        if (copyAns) {
+            udidStr = copyAns(@"UniqueDeviceID", nil) ?: @"";
+            if (udidStr.length < 20) {
+                NSString *idfv = copyAns(@"IdentifierForVendor", nil) ?: @"";
+                if (idfv.length > udidStr.length) udidStr = idfv;
+            }
+            if (udidStr.length < 20) {
+                NSString *serial = copyAns(@"SerialNumber", nil) ?: @"";
+                if (serial.length > udidStr.length) udidStr = serial;
+            }
+        }
+        dlclose(mg);
+    }
+    if (udidStr.length < 10) {
+        udidStr = [UIDevice currentDevice].identifierForVendor.UUIDString ?: @"";
+    }
     
     [_spinner startAnimating];
     _keyField.enabled = NO;
@@ -2298,11 +2331,26 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
 }
 
 - (NSString *)NTM_readUDID {
+    NSString *udid = @"";
     void *mg = dlopen("/System/Library/PrivateFrameworks/MobileGestalt.framework/MobileGestalt", RTLD_NOW);
-    if (!mg) return @"";
-    NSString *(*copyAns)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
-    NSString *udid = copyAns ? copyAns(@"UniqueDeviceID", nil) : @"";
-    dlclose(mg);
+    if (mg) {
+        NSString *(*copyAns)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
+        if (copyAns) {
+            udid = copyAns(@"UniqueDeviceID", nil) ?: @"";
+            if (udid.length < 20) {
+                NSString *idfv = copyAns(@"IdentifierForVendor", nil) ?: @"";
+                if (idfv.length > udid.length) udid = idfv;
+            }
+            if (udid.length < 20) {
+                NSString *serial = copyAns(@"SerialNumber", nil) ?: @"";
+                if (serial.length > udid.length) udid = serial;
+            }
+        }
+        dlclose(mg);
+    }
+    if (udid.length < 10) {
+        udid = [UIDevice currentDevice].identifierForVendor.UUIDString ?: @"";
+    }
     return udid ?: @"";
 }
 
