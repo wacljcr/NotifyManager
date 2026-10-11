@@ -2093,9 +2093,10 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
 - (void)activationTapped {
     NSUserDefaults *d = NTM_prefs();
     NSString *key = [d stringForKey:@"NTM_activation_key"];
+    NSString *udid = [self NTM_readUDID];
     
     UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔑 卡密激活"
-        message:@"输入卡密激活通知管理插件"
+        message:[NSString stringWithFormat:@"当前设备 UDID: %@\n\n输入卡密激活（将自动绑定此设备）", udid.length > 16 ? [[udid substringToIndex:8] stringByAppendingFormat:@"...%@", [udid substringFromIndex:udid.length-6]] : udid]
         preferredStyle:UIAlertControllerStyleAlert];
     [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
         tf.secureTextEntry = YES;
@@ -2104,20 +2105,81 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
         tf.font = [UIFont fontWithName:@"Menlo" size:14];
     }];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+    [ac addAction:[UIAlertAction actionWithTitle:@"清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        [d removeObjectForKey:@"NTM_activation_key"];
+        [d removeObjectForKey:@"NTM_verify_expires"];
+        [d removeObjectForKey:@"NTM_verify_udid"];
+        [d synchronize];
+        [self toast:@"已清除卡密"];
+        [self refreshActivationBar];
+    }]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"验证并保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
         NSString *newKey = [ac.textFields[0].text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
         if (newKey.length == 0) {
-            [d removeObjectForKey:@"NTM_activation_key"];
-            [d removeObjectForKey:@"NTM_verify_expires"];
-            [d removeObjectForKey:@"NTM_verify_udid"];
-            [d synchronize];
-            [self toast:@"已清除卡密"];
-        } else {
-            [d setObject:newKey forKey:@"NTM_activation_key"];
-            [d removeObjectForKey:@"NTM_verify_expires"];
-            [d synchronize];
-            [self toast:@"卡密已保存，重启设备后生效"];
+            [self toast:@"卡密不能为空"];
+            return;
         }
+        [self toast:@"正在验证..."];
+        // 同步请求 verify.php（超时 10s）
+        NSString *urlStr = [NSString stringWithFormat:@"http://101.200.189.251/verify.php?key=%@&udid=%@",
+                            [newKey stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]],
+                            [udid  stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
+        NSURLRequest *req = [NSURLRequest requestWithURL:[NSURL URLWithString:urlStr]
+                                             cachePolicy:NSURLRequestReloadIgnoringLocalAndRemoteCacheData
+                                         timeoutInterval:10];
+        NSURLResponse *resp = nil; NSError *err = nil;
+        NSData *data = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:&err];
+        if (err || !data) {
+            [self toast:[NSString stringWithFormat:@"网络错误：%@", err.localizedDescription ?: @"无响应"]];
+            return;
+        }
+        NSError *je = nil;
+        id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&je];
+        if (je || ![json isKindOfClass:[NSDictionary class]]) {
+            NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
+            [self toast:[NSString stringWithFormat:@"服务器返回异常：%@", raw.length > 40 ? [raw substringToIndex:40] : raw]];
+            return;
+        }
+        BOOL ok = [json[@"ok"] boolValue];
+        BOOL valid = [json[@"valid"] boolValue];
+        if (!ok || !valid) {
+            NSString *reason = json[@"reason"] ?: @"未知错误";
+            NSString *msg;
+            if ([reason isEqualToString:@"invalid"])       msg = @"❌ 卡密无效";
+            else if ([reason isEqualToString:@"expired"])   msg = @"❌ 卡密已过期";
+            else if ([reason isEqualToString:@"udid_mismatch"]) msg = @"❌ 此卡密已绑定其他设备";
+            else if ([reason isEqualToString:@"missing_key"]) msg = @"❌ 卡密为空";
+            else msg = [NSString stringWithFormat:@"❌ 验证失败：%@", reason];
+            [self toast:msg];
+            return;
+        }
+        // ✅ 验证通过！存卡密 + 存 expires + 存 udid
+        [d setObject:newKey forKey:@"NTM_activation_key"];
+        [d setObject:udid   forKey:@"NTM_verify_udid"];
+        // 服务器返回的 expires 解析 + 7 天宽限期（和 Tweak.m init() 对齐）
+        NSString *expStr = json[@"expires"];
+        NSDate *expDate = nil;
+        if (expStr && ![expStr isEqualToString:@"永久"]) {
+            static NSDateFormatter *fm = nil;
+            if (!fm) { fm = [[NSDateFormatter alloc] init]; fm.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"]; }
+            fm.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+            expDate = [fm dateFromString:expStr];
+            if (expDate) expDate = [expDate dateByAddingTimeInterval:7*86400];  // +7 天缓冲
+        } else {
+            expDate = [NSDate dateWithTimeIntervalSinceNow:365*86400];  // 永久：给 1 年
+        }
+        if (expDate) [d setObject:expDate forKey:@"NTM_verify_expires"];
+        [d synchronize];
+        
+        // 发 Darwin 通知让 SpringBoard 那边也知道
+        CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(),
+            (CFNotificationName)@"com.ntm.notifymanager.activationChanged",
+            NULL, NULL, YES);
+        CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(),
+            (CFNotificationName)@"com.ntm.notifymanager.needRestart",
+            NULL, NULL, YES);
+        
+        [self toast:@"✅ 验证通过！重启设置生效"];
         [self refreshActivationBar];
     }]];
     [self presentViewController:ac animated:YES completion:nil];
