@@ -786,11 +786,14 @@ __attribute__((constructor)) static void init() {
         NSNumber *verifyExpires = lic[@"verify_expires"];
         NSString *verifyUdid = lic[@"verify_udid"];
         
-        fprintf(stderr, "[NTM] savedKey=%s expires=%@ udid_cached=%@ path=%s",
-                savedKey.length ? [savedKey UTF8String] : "(nil)",
-                verifyExpires ?: @"(nil)",
-                verifyUdid ?: @"(nil)",
-                [NTM_licensePath() UTF8String]);
+        char keyBuf[256] = "(nil)";
+        if (savedKey.length) snprintf(keyBuf, sizeof(keyBuf), "%s", savedKey.UTF8String);
+        char expBuf[128] = "(nil)";
+        if (verifyExpires) snprintf(expBuf, sizeof(expBuf), "%.0f", verifyExpires.doubleValue);
+        char udidBuf[64] = "(nil)";
+        if (verifyUdid.length) snprintf(udidBuf, sizeof(udidBuf), "%s", verifyUdid.UTF8String);
+        fprintf(stderr, "[NTM] savedKey=%s expires=%s udid_cached=%s path=%s",
+                keyBuf, expBuf, udidBuf, [NTM_licensePath() UTF8String]);
         
         // 读 UDID
         NSString *udid = nil;
