@@ -598,6 +598,120 @@ static void NTM_scheduleMirror(void) {
 
 __attribute__((constructor)) static void init() {
     @autoreleasepool {
+        // ===== 卡密验证（2.3.24 新增）=====
+        // 读取保存的激活码
+        NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
+        NSString *savedKey = [d stringForKey:@"NTM_activation_key"];
+        NSDate *verifyExpires = [d objectForKey:@"NTM_verify_expires"];
+        NSString *verifyUdid = [d stringForKey:@"NTM_verify_udid"];
+        
+        // 读 UDID
+        NSString *udid = nil;
+        void *mg = dlopen("/System/Library/PrivateFrameworks/MobileGestalt.framework/MobileGestalt", RTLD_NOW);
+        if (mg) {
+            NSString *(*copyAnswer)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
+            if (copyAnswer) udid = copyAnswer(@"UniqueDeviceID", nil);
+            dlclose(mg);
+        }
+        
+        // 判断验证状态
+        BOOL verified = NO;
+        if (savedKey.length && verifyExpires) {
+            // 本地有缓存 + 未过期
+            if ([verifyExpires compare:[NSDate date]] != NSOrderedAscending) {
+                // UDID 匹配（如果之前绑定过）
+                if (!verifyUdid.length || !udid.length || [verifyUdid isEqualToString:udid]) {
+                    verified = YES;
+                }
+            }
+        }
+        
+        // 设置面板改了卡密 → 重新验证
+        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                        NULL, NTM_cacheInvalidated,
+                                        CFSTR("com.ntm.notifymanager.activationChanged"),
+                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+        
+        // 如果没验证通过，发异步请求验证服务器（不阻塞启动）
+        if (!verified && savedKey.length) {
+            NSString *udidStr = udid ?: @"";
+            NSString *paramKey = [savedKey stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
+            NSString *paramUdid = [udidStr stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]];
+            NSString *urlStr = [NSString stringWithFormat:@"http://101.200.189.251/verify.php?key=%@&udid=%@", paramKey, paramUdid];
+            NSURL *vurl = [NSURL URLWithString:urlStr];
+            if (vurl) {
+                NSMutableURLRequest *vreq = [NSMutableURLRequest requestWithURL:vurl];
+                vreq.timeoutInterval = 8;
+                [NSURLConnection sendAsynchronousRequest:vreq queue:[NSOperationQueue mainQueue]
+                                      completionHandler:^(NSURLResponse *resp, NSData *data, NSError *err) {
+                    if (!err && data) {
+                        @try {
+                            id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+                            if ([json isKindOfClass:[NSDictionary class]] && [json[@"valid"] boolValue]) {
+                                NSUserDefaults *dd = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
+                                if (json[@"expires"]) {
+                                    // 服务器返回了过期时间，加 7 天宽限期作为缓存
+                                    NSDateFormatter *fmt = [[NSDateFormatter alloc] init];
+                                    fmt.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+                                    NSDate *ed = [fmt dateFromString:json[@"expires"]];
+                                    if (!ed) fmt.dateFormat = @"yyyy-MM-dd";
+                                    ed = ed ?: [fmt dateFromString:json[@"expires"]];
+                                    if (ed) [dd setObject:[ed dateByAddingTimeInterval:7*86400] forKey:@"NTM_verify_expires"];
+                                }
+                                if (![dd objectForKey:@"NTM_verify_expires"]) {
+                                    [dd setObject:[[NSDate date] dateByAddingTimeInterval:7*86400] forKey:@"NTM_verify_expires"];
+                                }
+                                [dd setObject:udidStr forKey:@"NTM_verify_udid"];
+                                [dd synchronize];
+                                // 通知设置面板刷新状态
+                                CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                    CFSTR("com.ntm.notifymanager.verifyResult"), NULL,
+                                    (__bridge CFDictionaryRef)@{@"valid": @YES}, YES);
+                            } else {
+                                CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                                    CFSTR("com.ntm.notifymanager.verifyResult"), NULL,
+                                    (__bridge CFDictionaryRef)@{@"valid": @NO}, YES);
+                            }
+                        } @catch (NSException *e) {}
+                    }
+                }];
+            }
+        }
+        
+        // 未验证通过 → 跳过所有 hooks（功能等于没装）
+        // 但注册 configChanged/mirrorUpdated 通知（设置面板还能用）
+        if (!verified) {
+            // 监听 activationChanged → 面板输入卡密后重走 init
+            CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                            NULL, NTM_cacheInvalidated,
+                                            CFSTR("com.ntm.notifymanager.configChanged"),
+                                            NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+            CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
+                                            NULL, NTM_mirrorUpdatedCb,
+                                            CFSTR("com.ntm.notifymanager.mirrorUpdated"),
+                                            NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
+            
+            // SpringBoard 进程：10s 后再次检查验证状态（面板可能刚激活了）
+            if (NTM_isSpringBoard()) {
+                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
+                               dispatch_get_main_queue(), ^{
+                    NSUserDefaults *dd = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
+                    NSString *k = [dd stringForKey:@"NTM_activation_key"];
+                    NSDate *ex = [dd objectForKey:@"NTM_verify_expires"];
+                    if (k.length && ex && [ex compare:[NSDate date]] != NSOrderedAscending) {
+                        // 面板已激活，但 SpringBoard 进程 init() 已过，
+                        // 这里发个 Darwin 通知让面板显示「请重启设备」
+                        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
+                            CFSTR("com.ntm.notifymanager.needRestart"), NULL, NULL, YES);
+                    }
+                });
+            }
+            
+            return; // ← 不验证通过就退出，下面的 tryHook 全跳过
+        }
+        
+        // ===== 以下为 2.3.24 前的原始 init 逻辑，只在验证通过后执行 =====
+        
         // 监听设置面板的配置变更通知，清空内存缓存
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
                                         NULL, NTM_cacheInvalidated,
@@ -617,6 +731,8 @@ __attribute__((constructor)) static void init() {
 
         // 自动授权通知默认开启：保证重装/抹除后打开 App 不再弹授权框（面板可手动关）
         [NTM_prefs() registerDefaults:@{@"NTM_autoAuth": @YES}];
+
+        // ===== 所有 hooks =====
 
         // 总开关 + 关键词过滤 + 隐藏预览
         tryHook(objc_getClass("NCNotificationDispatcher"),

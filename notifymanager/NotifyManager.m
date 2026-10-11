@@ -910,6 +910,7 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
                                                                              style:UIBarButtonItemStylePlain
                                                                             target:self action:@selector(feedback)];
     [self buildUI];
+    [self setupActivationBar];
 
     _spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
     _spinner.translatesAutoresizingMaskIntoConstraints = NO;
@@ -1906,6 +1907,132 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     [UIView animateWithDuration:0.2 animations:^{ l.alpha = 1; }];
     dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
         [UIView animateWithDuration:0.3 animations:^{ l.alpha = 0; } completion:^(BOOL f){ [l removeFromSuperview]; }];
+    });
+}
+
+#pragma mark - 卡密激活 (2.3.24)
+- (void)setupActivationBar {
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+        CFNotificationCallback, CFSTR("com.ntm.notifymanager.verifyResult"), NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately);
+    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
+        CFNotificationCallback, CFSTR("com.ntm.notifymanager.needRestart"), NULL,
+        CFNotificationSuspensionBehaviorDeliverImmediately);
+    [self refreshActivationBar];
+}
+
+- (void)refreshActivationBar {
+    static UIView *bar = nil;
+    if (bar) { [bar removeFromSuperview]; bar = nil; }
+    
+    NSUserDefaults *d = NTM_prefs();
+    NSString *key = [d stringForKey:@"NTM_activation_key"];
+    NSDate *exp = [d objectForKey:@"NTM_verify_expires"];
+    BOOL active = key.length && exp && [exp compare:[NSDate date]] != NSOrderedAscending;
+    
+    CGFloat w = self.view.bounds.size.width - 32;
+    CGFloat h = 76;
+    bar = [[UIView alloc] initWithFrame:CGRectMake(16, 0, w, h)];
+    bar.backgroundColor = active
+        ? [UIColor colorWithRed:0.88 green:0.96 blue:0.90 alpha:1]
+        : [UIColor colorWithRed:1.0 green:0.92 blue:0.82 alpha:1];
+    bar.layer.cornerRadius = 12;
+    
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14, 8, w-28, 22)];
+    title.font = [UIFont boldSystemFontOfSize:15];
+    title.text = active ? @"✅ 已激活" : @"🔑 卡密激活";
+    title.textColor = active ? [UIColor colorWithRed:0.13 green:0.55 blue:0.24 alpha:1] : [UIColor colorWithRed:0.85 green:0.40 blue:0.10 alpha:1];
+    [bar addSubview:title];
+    
+    UILabel *detail = [[UILabel alloc] initWithFrame:CGRectMake(14, 30, w-100, 22)];
+    detail.font = [UIFont systemFontOfSize:13];
+    detail.textColor = [UIColor grayColor];
+    if (active) {
+        NSDateFormatter *f = [[NSDateFormatter alloc] init];
+        f.dateFormat = @"yyyy-MM-dd";
+        NSDate *real = [NSDate dateWithTimeIntervalSinceNow:-7*86400]; // 减掉 7 天宽限期
+        detail.text = [NSString stringWithFormat:@"有效期至 %@", [f stringFromDate:real]];
+    } else {
+        detail.text = key.length ? @"验证中或已过期..." : @"未输入卡密，插件功能会被禁用";
+    }
+    [bar addSubview:detail];
+    
+    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
+    btn.frame = CGRectMake(w-80, 16, 66, 44);
+    [btn setTitle:active ? @"管理" : @"激活" forState:UIControlStateNormal];
+    btn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
+    btn.backgroundColor = active ? [UIColor colorWithRed:0.20 green:0.65 blue:0.35 alpha:1] : [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1];
+    [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    btn.layer.cornerRadius = 10;
+    [btn addTarget:self action:@selector(activationTapped) forControlEvents:UIControlEventTouchUpInside];
+    [bar addSubview:btn];
+    
+    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, h + 8)];
+    [header addSubview:bar];
+    bar.translatesAutoresizingMaskIntoConstraints = NO;
+    [NSLayoutConstraint activateConstraints:@[
+        [bar.topAnchor constraintEqualToAnchor:header.topAnchor constant:4],
+        [bar.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16],
+        [bar.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16],
+        [bar.heightAnchor constraintEqualToConstant:h],
+    ]];
+    for (UIView *v in self.view.subviews) {
+        if ([v isKindOfClass:[UITableView class]]) {
+            ((UITableView *)v).tableHeaderView = header;
+            break;
+        }
+    }
+    [self reloadList];
+}
+
+- (void)activationTapped {
+    NSUserDefaults *d = NTM_prefs();
+    NSString *key = [d stringForKey:@"NTM_activation_key"];
+    
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔑 卡密激活"
+        message:@"输入卡密激活通知管理插件"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
+        tf.secureTextEntry = YES;
+        tf.placeholder = @"输入卡密";
+        tf.text = key;
+        tf.font = [UIFont fontWithName:@"Menlo" size:14];
+    }];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
+        NSString *newKey = [ac.textFields[0].text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+        if (newKey.length == 0) {
+            [d removeObjectForKey:@"NTM_activation_key"];
+            [d removeObjectForKey:@"NTM_verify_expires"];
+            [d removeObjectForKey:@"NTM_verify_udid"];
+            [d synchronize];
+            [self toast:@"已清除卡密"];
+        } else {
+            [d setObject:newKey forKey:@"NTM_activation_key"];
+            [d removeObjectForKey:@"NTM_verify_expires"];
+            [d synchronize];
+            [self toast:@"卡密已保存，重启设备后生效"];
+        }
+        [self refreshActivationBar];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+void CFNotificationCallback(CFNotificationCenterRef center, void *observer, CFNotificationName name, const void *object, CFDictionaryRef userInfo) {
+    dispatch_async(dispatch_get_main_queue(), ^{
+        UIWindow *w = [UIApplication sharedApplication].keyWindow;
+        UIViewController *vc = w.rootViewController;
+        if ([vc isKindOfClass:[UINavigationController class]]) vc = ((UINavigationController *)vc).visibleViewController;
+        if ([vc respondsToSelector:@selector(refreshActivationBar)]) {
+            [vc performSelector:@selector(refreshActivationBar)];
+        }
+        if ([(__bridge NSString *)name isEqualToString:@"com.ntm.notifymanager.needRestart"]) {
+            UIAlertController *a = [UIAlertController alertControllerWithTitle:@"✅ 卡密已激活"
+                message:@"重启设备后插件完全生效\n（设置 → 通知管理 → 关闭再开启也可）"
+                preferredStyle:UIAlertControllerStyleAlert];
+            [a addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+            [vc presentViewController:a animated:YES completion:nil];
+        }
     });
 }
 
