@@ -36,6 +36,17 @@ static NSArray *NTM_allApps(void);
 @interface NTMPrincipalController : PSViewController <UISearchBarDelegate, UIDocumentPickerDelegate, UITableViewDelegate, UITableViewDataSource>
 @end
 
+// 激活相关方法声明（category）
+@interface NTMPrincipalController (ActivationStuff)
+- (void)setupActivationBar;
+- (void)showActivationModalIfNeeded;
+- (BOOL)NTM_isActivated;
+- (void)activationSucceed;
+- (void)NTM_applyLock;
+- (void)NTM_disableControlsIn:(UIView *)view locked:(BOOL)lock;
+- (NSString *)NTM_readUDID;
+@end
+
 #pragma mark - 存储: NSUserDefaults suiteName (Tweak 读取同一份)
 static NSString *NTM_suite = @"com.ntm.notifymanager";
 static NSString *NTM_key(NSString *appId, NSString *dim) {
@@ -911,7 +922,7 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
                                                                              style:UIBarButtonItemStylePlain
                                                                             target:self action:@selector(feedback)];
     [self buildUI];
-    [self setupActivationBar];
+    [self setupActivationBar];  // 注册 Darwin 通知
 
     _spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
     _spinner.translatesAutoresizingMaskIntoConstraints = NO;
@@ -930,6 +941,11 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
             [self reloadList];
         });
     });
+}
+
+- (void)viewDidAppear:(BOOL)animated {
+    [super viewDidAppear:animated];
+    [self showActivationModalIfNeeded];
 }
 
 - (void)autoAuthChanged {
@@ -1912,277 +1928,405 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     });
 }
 
+@end   // ← 关掉原来的 NTMPrincipalController
+
 #pragma mark - 卡密激活 (2.3.24)
+
+// === NTMActivationVC —— 全屏遮罩，挡住所有功能按钮 ===
+@interface NTMActivationVC : UIViewController <UITextFieldDelegate> {
+    UITextField *_keyField;
+    UIActivityIndicatorView *_spinner;
+    UILabel *_udidLabel;
+    UIButton *_copyBtn;
+}
+@end
+
+@implementation NTMActivationVC
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.view.backgroundColor = [[UIColor blackColor] colorWithAlphaComponent:0.85];
+    self.modalPresentationStyle = UIModalPresentationOverFullScreen;
+    self.modalTransitionStyle = UIModalTransitionStyleCrossDissolve;
+    
+    CGFloat w = self.view.bounds.size.width;
+    
+    UIBlurEffect *be = [UIBlurEffect effectWithStyle:UIBlurEffectStyleDark];
+    UIVisualEffectView *blur = [[UIVisualEffectView alloc] initWithEffect:be];
+    blur.frame = self.view.bounds;
+    blur.autoresizingMask = UIViewAutoresizingFlexibleWidth | UIViewAutoresizingFlexibleHeight;
+    [self.view addSubview:blur];
+    
+    UIView *card = [[UIView alloc] init];
+    card.translatesAutoresizingMaskIntoConstraints = NO;
+    card.backgroundColor = [UIColor whiteColor];
+    card.layer.cornerRadius = 18;
+    card.layer.shadowColor = [UIColor blackColor].CGColor;
+    card.layer.shadowOpacity = 0.3;
+    card.layer.shadowRadius = 20;
+    card.layer.shadowOffset = CGSizeZero;
+    [self.view addSubview:card];
+    
+    UILabel *icon = [[UILabel alloc] init];
+    icon.translatesAutoresizingMaskIntoConstraints = NO;
+    icon.text = @"🔑";
+    icon.font = [UIFont systemFontOfSize:56];
+    icon.textAlignment = NSTextAlignmentCenter;
+    [card addSubview:icon];
+    
+    UILabel *title = [[UILabel alloc] init];
+    title.translatesAutoresizingMaskIntoConstraints = NO;
+    title.text = @"通知管理 · 卡密激活";
+    title.font = [UIFont boldSystemFontOfSize:20];
+    title.textColor = [UIColor blackColor];
+    title.textAlignment = NSTextAlignmentCenter;
+    [card addSubview:title];
+    
+    UILabel *sub = [[UILabel alloc] init];
+    sub.translatesAutoresizingMaskIntoConstraints = NO;
+    sub.text = @"输入卡密解锁插件全部功能\n未激活时插件不生效";
+    sub.font = [UIFont systemFontOfSize:13];
+    sub.textColor = [UIColor colorWithRed:0.45 green:0.45 blue:0.50 alpha:1];
+    sub.textAlignment = NSTextAlignmentCenter;
+    sub.numberOfLines = 0;
+    [card addSubview:sub];
+    
+    // UDID
+    UIView *udidBox = [[UIView alloc] init];
+    udidBox.translatesAutoresizingMaskIntoConstraints = NO;
+    udidBox.backgroundColor = [UIColor colorWithRed:0.96 green:0.97 blue:0.98 alpha:1];
+    udidBox.layer.cornerRadius = 10;
+    [card addSubview:udidBox];
+    
+    UILabel *udidTitle = [[UILabel alloc] init];
+    udidTitle.translatesAutoresizingMaskIntoConstraints = NO;
+    udidTitle.text = @"📱 你的设备 UDID";
+    udidTitle.font = [UIFont boldSystemFontOfSize:12];
+    udidTitle.textColor = [UIColor colorWithRed:0.30 green:0.30 blue:0.35 alpha:1];
+    [udidBox addSubview:udidTitle];
+    
+    void *mg = dlopen("/System/Library/PrivateFrameworks/MobileGestalt.framework/MobileGestalt", RTLD_NOW);
+    NSString *(*copyAns)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
+    NSString *udidStr = copyAns ? copyAns(@"UniqueDeviceID", nil) : @"";
+    dlclose(mg);
+    
+    _udidLabel = [[UILabel alloc] init];
+    _udidLabel.translatesAutoresizingMaskIntoConstraints = NO;
+    _udidLabel.text = udidStr.length > 0 ? udidStr : @"（读不到）";
+    _udidLabel.font = [UIFont fontWithName:@"Menlo" size:11];
+    _udidLabel.textColor = [UIColor colorWithRed:0.20 green:0.20 blue:0.25 alpha:1];
+    _udidLabel.numberOfLines = 2;
+    _udidLabel.lineBreakMode = NSLineBreakByTruncatingMiddle;
+    [udidBox addSubview:_udidLabel];
+    
+    _copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    _copyBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [_copyBtn setTitle:@"复制" forState:UIControlStateNormal];
+    _copyBtn.titleLabel.font = [UIFont boldSystemFontOfSize:13];
+    [_copyBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    _copyBtn.backgroundColor = [UIColor colorWithRed:0.20 green:0.55 blue:0.95 alpha:1];
+    _copyBtn.layer.cornerRadius = 8;
+    [_copyBtn addTarget:self action:@selector(copyUdid) forControlEvents:UIControlEventTouchUpInside];
+    [udidBox addSubview:_copyBtn];
+    
+    UILabel *hint = [[UILabel alloc] init];
+    hint.translatesAutoresizingMaskIntoConstraints = NO;
+    hint.text = @"把 UDID 发给卖家，获取你的专属卡密";
+    hint.font = [UIFont systemFontOfSize:11];
+    hint.textColor = [UIColor colorWithRed:0.55 green:0.55 blue:0.60 alpha:1];
+    hint.textAlignment = NSTextAlignmentCenter;
+    [udidBox addSubview:hint];
+    
+    // 输入框
+    UIView *inputBox = [[UIView alloc] init];
+    inputBox.translatesAutoresizingMaskIntoConstraints = NO;
+    inputBox.backgroundColor = [UIColor colorWithRed:0.96 green:0.97 blue:0.98 alpha:1];
+    inputBox.layer.cornerRadius = 10;
+    [card addSubview:inputBox];
+    
+    _keyField = [[UITextField alloc] init];
+    _keyField.translatesAutoresizingMaskIntoConstraints = NO;
+    _keyField.placeholder = @"粘贴或输入卡密 (XXXX-XXXX-XXXX)";
+    _keyField.font = [UIFont fontWithName:@"Menlo" size:14];
+    _keyField.returnKeyType = UIReturnKeyDone;
+    _keyField.autocapitalizationType = UITextAutocapitalizationTypeNone;
+    _keyField.autocorrectionType = UITextAutocorrectionTypeNo;
+    _keyField.delegate = self;
+    [inputBox addSubview:_keyField];
+    
+    _spinner = [[UIActivityIndicatorView alloc] initWithActivityIndicatorStyle:UIActivityIndicatorViewStyleMedium];
+    _spinner.translatesAutoresizingMaskIntoConstraints = NO;
+    [inputBox addSubview:_spinner];
+    
+    UIButton *activateBtn = [UIButton buttonWithType:UIButtonTypeCustom];
+    activateBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [activateBtn setTitle:@"✅ 验证并激活" forState:UIControlStateNormal];
+    activateBtn.titleLabel.font = [UIFont boldSystemFontOfSize:16];
+    [activateBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    activateBtn.backgroundColor = [UIColor colorWithRed:0.20 green:0.65 blue:0.35 alpha:1];
+    activateBtn.layer.cornerRadius = 12;
+    [activateBtn addTarget:self action:@selector(doActivate) forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:activateBtn];
+    
+    UIButton *clearBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+    clearBtn.translatesAutoresizingMaskIntoConstraints = NO;
+    [clearBtn setTitle:@"清除已保存卡密" forState:UIControlStateNormal];
+    clearBtn.titleLabel.font = [UIFont systemFontOfSize:12];
+    [clearBtn setTitleColor:[UIColor colorWithRed:0.70 green:0.30 blue:0.20 alpha:1] forState:UIControlStateNormal];
+    [clearBtn addTarget:self action:@selector(doClear) forControlEvents:UIControlEventTouchUpInside];
+    [card addSubview:clearBtn];
+    
+    [NSLayoutConstraint activateConstraints:@[
+        [card.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [card.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor constant:-20],
+        [card.widthAnchor constraintEqualToAnchor:self.view.widthAnchor constant:-40],
+        
+        [icon.topAnchor constraintEqualToAnchor:card.topAnchor constant:20],
+        [icon.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
+        
+        [title.topAnchor constraintEqualToAnchor:icon.bottomAnchor constant:4],
+        [title.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:20],
+        [title.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-20],
+        
+        [sub.topAnchor constraintEqualToAnchor:title.bottomAnchor constant:4],
+        [sub.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:20],
+        [sub.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-20],
+        
+        [udidBox.topAnchor constraintEqualToAnchor:sub.bottomAnchor constant:16],
+        [udidBox.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:20],
+        [udidBox.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-20],
+        [udidBox.heightAnchor constraintGreaterThanOrEqualToConstant:80],
+        
+        [udidTitle.topAnchor constraintEqualToAnchor:udidBox.topAnchor constant:10],
+        [udidTitle.leadingAnchor constraintEqualToAnchor:udidBox.leadingAnchor constant:12],
+        [udidTitle.trailingAnchor constraintEqualToAnchor:_copyBtn.leadingAnchor constant:-8],
+        
+        [_udidLabel.topAnchor constraintEqualToAnchor:udidTitle.bottomAnchor constant:2],
+        [_udidLabel.leadingAnchor constraintEqualToAnchor:udidBox.leadingAnchor constant:12],
+        [_udidLabel.trailingAnchor constraintEqualToAnchor:_copyBtn.leadingAnchor constant:-8],
+        
+        [_copyBtn.centerYAnchor constraintEqualToAnchor:udidBox.centerYAnchor],
+        [_copyBtn.trailingAnchor constraintEqualToAnchor:udidBox.trailingAnchor constant:-12],
+        [_copyBtn.widthAnchor constraintEqualToConstant:56],
+        [_copyBtn.heightAnchor constraintEqualToConstant:32],
+        
+        [hint.topAnchor constraintEqualToAnchor:_udidLabel.bottomAnchor constant:2],
+        [hint.leadingAnchor constraintEqualToAnchor:udidBox.leadingAnchor constant:12],
+        [hint.trailingAnchor constraintEqualToAnchor:udidBox.trailingAnchor constant:-12],
+        
+        [inputBox.topAnchor constraintEqualToAnchor:udidBox.bottomAnchor constant:14],
+        [inputBox.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:20],
+        [inputBox.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-20],
+        [inputBox.heightAnchor constraintEqualToConstant:48],
+        
+        [_keyField.leadingAnchor constraintEqualToAnchor:inputBox.leadingAnchor constant:12],
+        [_keyField.trailingAnchor constraintEqualToAnchor:_spinner.leadingAnchor constant:-6],
+        [_keyField.centerYAnchor constraintEqualToAnchor:inputBox.centerYAnchor],
+        [_keyField.heightAnchor constraintEqualToConstant:40],
+        
+        [_spinner.trailingAnchor constraintEqualToAnchor:inputBox.trailingAnchor constant:-12],
+        [_spinner.centerYAnchor constraintEqualToAnchor:inputBox.centerYAnchor],
+        
+        [activateBtn.topAnchor constraintEqualToAnchor:inputBox.bottomAnchor constant:14],
+        [activateBtn.leadingAnchor constraintEqualToAnchor:card.leadingAnchor constant:20],
+        [activateBtn.trailingAnchor constraintEqualToAnchor:card.trailingAnchor constant:-20],
+        [activateBtn.heightAnchor constraintEqualToConstant:48],
+        
+        [clearBtn.topAnchor constraintEqualToAnchor:activateBtn.bottomAnchor constant:6],
+        [clearBtn.centerXAnchor constraintEqualToAnchor:card.centerXAnchor],
+        [clearBtn.bottomAnchor constraintEqualToAnchor:card.bottomAnchor constant:-14],
+    ]];
+}
+
+- (void)copyUdid {
+    _copyBtn.backgroundColor = [UIColor colorWithRed:0.15 green:0.80 blue:0.40 alpha:1];
+    [_copyBtn setTitle:@"已复制" forState:UIControlStateNormal];
+    [UIPasteboard generalPasteboard].string = _udidLabel.text ?: @"";
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 1500*NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        self->_copyBtn.backgroundColor = [UIColor colorWithRed:0.20 green:0.55 blue:0.95 alpha:1];
+        [self->_copyBtn setTitle:@"复制" forState:UIControlStateNormal];
+    });
+}
+
+- (void)doActivate {
+    NSString *newKey = [_keyField.text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    if (newKey.length == 0) return;
+    
+    void *mg = dlopen("/System/Library/PrivateFrameworks/MobileGestalt.framework/MobileGestalt", RTLD_NOW);
+    NSString *(*copyAns)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
+    NSString *udidStr = copyAns ? copyAns(@"UniqueDeviceID", nil) : @"";
+    dlclose(mg);
+    
+    [_spinner startAnimating];
+    _keyField.enabled = NO;
+    
+    NSString *urlStr = [NSString stringWithFormat:@"http://101.200.189.251/verify.php?key=%@&udid=%@",
+                        [newKey stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]],
+                        [udidStr  stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
+    NSURLRequest *req = [NSURLRequest requestWithURL:[NSURL URLWithString:urlStr]
+                                         cachePolicy:NSURLRequestReloadIgnoringLocalAndRemoteCacheData
+                                     timeoutInterval:10];
+    NSURLResponse *resp = nil; NSError *err = nil;
+    NSData *data = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:&err];
+    
+    [_spinner stopAnimating];
+    _keyField.enabled = YES;
+    
+    if (err || !data) {
+        [self flashError:[NSString stringWithFormat:@"网络错误：%@", err.localizedDescription ?: @"无响应"]];
+        return;
+    }
+    
+    NSError *je = nil;
+    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&je];
+    if (je || ![json isKindOfClass:[NSDictionary class]]) {
+        [self flashError:@"服务器返回异常"];
+        return;
+    }
+    
+    BOOL ok = [json[@"ok"] boolValue];
+    BOOL valid = [json[@"valid"] boolValue];
+    if (!ok || !valid) {
+        NSString *reason = json[@"reason"] ?: @"未知";
+        NSString *msg;
+        if ([reason isEqualToString:@"invalid"]) msg = @"❌ 卡密无效";
+        else if ([reason isEqualToString:@"expired"]) msg = @"❌ 卡密已过期";
+        else if ([reason isEqualToString:@"udid_mismatch"]) msg = @"❌ 此卡密已绑定其他设备";
+        else if ([reason isEqualToString:@"missing_key"]) msg = @"❌ 卡密为空";
+        else msg = [NSString stringWithFormat:@"❌ 验证失败：%@", reason];
+        [self flashError:msg];
+        return;
+    }
+    
+    // OK!
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"com.ntm.notifymanager"];
+    [d setObject:newKey forKey:@"NTM_activation_key"];
+    [d setObject:udidStr forKey:@"NTM_verify_udid"];
+    
+    NSString *expStr = json[@"expires"];
+    NSDate *expDate = nil;
+    if (expStr && ![expStr isEqualToString:@"永久"]) {
+        static NSDateFormatter *fm = nil;
+        if (!fm) { fm = [[NSDateFormatter alloc] init]; fm.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"]; }
+        fm.dateFormat = @"yyyy-MM-dd HH:mm:ss";
+        expDate = [fm dateFromString:expStr];
+        if (expDate) expDate = [expDate dateByAddingTimeInterval:7*86400];
+    } else {
+        expDate = [NSDate dateWithTimeIntervalSinceNow:365*86400];
+    }
+    if (expDate) [d setObject:expDate forKey:@"NTM_verify_expires"];
+    [d synchronize];
+    
+    CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(),
+        (CFNotificationName)@"com.ntm.notifymanager.activationChanged", NULL, NULL, YES);
+    
+    [self dismissViewControllerAnimated:YES completion:^{
+        UIViewController *parent = self.presentingViewController;
+        if ([parent respondsToSelector:@selector(activationSucceed)]) {
+            [parent performSelector:@selector(activationSucceed)];
+        }
+    }];
+}
+
+- (void)doClear {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"清除卡密"
+        message:@"确定清除已保存的卡密？清除后插件将被锁定"
+        preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
+    [ac addAction:[UIAlertAction actionWithTitle:@"清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"com.ntm.notifymanager"];
+        [d removeObjectForKey:@"NTM_activation_key"];
+        [d removeObjectForKey:@"NTM_verify_expires"];
+        [d removeObjectForKey:@"NTM_verify_udid"];
+        [d synchronize];
+        self->_keyField.text = @"";
+        [self flashError:@"已清除卡密"];
+    }]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (void)flashError:(NSString *)msg {
+    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"提示"
+        message:msg preferredStyle:UIAlertControllerStyleAlert];
+    [ac addAction:[UIAlertAction actionWithTitle:@"好" style:UIAlertActionStyleDefault handler:nil]];
+    [self presentViewController:ac animated:YES completion:nil];
+}
+
+- (BOOL)textFieldShouldReturn:(UITextField *)textField {
+    [textField resignFirstResponder];
+    [self doActivate];
+    return YES;
+}
+
+@end
+
+@implementation NTMPrincipalController (ActivationStuff)
 - (void)setupActivationBar {
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-        NTMNotifyCallback, CFSTR("com.ntm.notifymanager.verifyResult"), NULL,
-        CFNotificationSuspensionBehaviorDeliverImmediately);
-    CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-        NTMNotifyCallback, CFSTR("com.ntm.notifymanager.needRestart"), NULL,
-        CFNotificationSuspensionBehaviorDeliverImmediately);
-    [self refreshActivationBar];
+    CFNotificationCenterAddObserver(CFNotificationCenterGetLocalCenter(), NULL,
+        &NTMNotifyCallback, (CFNotificationName)@"com.ntm.notifymanager.activationChanged", NULL, CFNotificationSuspensionBehaviorDrop);
+}
+
+- (BOOL)NTM_isActivated {
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"com.ntm.notifymanager"];
+    NSString *key = [d stringForKey:@"NTM_activation_key"];
+    NSDate *exp = [d objectForKey:@"NTM_verify_expires"];
+    if (!key.length || !exp) return NO;
+    if ([exp compare:[NSDate date]] == NSOrderedAscending) return NO;
+    return YES;
+}
+
+- (void)showActivationModalIfNeeded {
+    if ([self NTM_isActivated]) {
+        _ntmLocked = NO;
+        [self NTM_applyLock];
+        return;
+    }
+    _ntmLocked = YES;
+    [self NTM_applyLock];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, 400*NSEC_PER_MSEC), dispatch_get_main_queue(), ^{
+        if ([self NTM_isActivated]) return;
+        NTMActivationVC *vc = [[NTMActivationVC alloc] init];
+        [self presentViewController:vc animated:YES completion:nil];
+    });
+}
+
+- (void)activationSucceed {
+    [self toast:@"✅ 验证通过！插件已解锁"];
+    _ntmLocked = NO;
+    [self NTM_applyLock];
+    [self reloadList];
 }
 
 - (NSString *)NTM_readUDID {
     void *mg = dlopen("/System/Library/PrivateFrameworks/MobileGestalt.framework/MobileGestalt", RTLD_NOW);
     if (!mg) return @"";
-    NSString *(*copyAnswer)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
-    NSString *udid = copyAnswer ? copyAnswer(@"UniqueDeviceID", nil) : @"";
+    NSString *(*copyAns)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
+    NSString *udid = copyAns ? copyAns(@"UniqueDeviceID", nil) : @"";
     dlclose(mg);
     return udid ?: @"";
 }
 
-- (void)refreshActivationBar {
-    static UIView *bar = nil;
-    if (bar) { [bar removeFromSuperview]; bar = nil; }
-    
-    NSUserDefaults *d = NTM_prefs();
-    NSString *key = [d stringForKey:@"NTM_activation_key"];
-    NSDate *exp = [d objectForKey:@"NTM_verify_expires"];
-    BOOL active = key.length && exp && [exp compare:[NSDate date]] != NSOrderedAscending;
-    NSString *udid = [self NTM_readUDID];
-    
-    CGFloat w = self.view.bounds.size.width - 32;
-    CGFloat h = active ? 76 : 130;  // 未激活时高一点（放 UDID 行）
-    bar = [[UIView alloc] initWithFrame:CGRectMake(16, 0, w, h)];
-    bar.tag = 8888;  // 跳过 NTM_applyLock 的禁用
-    bar.backgroundColor = active
-        ? [UIColor colorWithRed:0.88 green:0.96 blue:0.90 alpha:1]
-        : [UIColor colorWithRed:1.0 green:0.92 blue:0.82 alpha:1];
-    bar.layer.cornerRadius = 12;
-    
-    // 🔑 标题
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14, 6, w-100, 22)];
-    title.font = [UIFont boldSystemFontOfSize:15];
-    title.text = active ? @"✅ 已激活" : @"🔑 卡密激活";
-    title.textColor = active
-        ? [UIColor colorWithRed:0.13 green:0.55 blue:0.24 alpha:1]
-        : [UIColor colorWithRed:0.85 green:0.40 blue:0.10 alpha:1];
-    [bar addSubview:title];
-    
-    // 详情（激活状态 / 过期时间）
-    UILabel *detail = [[UILabel alloc] initWithFrame:CGRectMake(14, 28, w-100, 18)];
-    detail.font = [UIFont systemFontOfSize:12];
-    detail.textColor = [UIColor grayColor];
-    if (active) {
-        NSDateFormatter *f = [[NSDateFormatter alloc] init];
-        f.dateFormat = @"yyyy-MM-dd";
-        NSDate *real = [NSDate dateWithTimeIntervalSinceNow:-7*86400];
-        detail.text = [NSString stringWithFormat:@"有效期至 %@", [f stringFromDate:real]];
-    } else {
-        detail.text = key.length ? @"验证中或已过期..." : @"未输入卡密，插件功能会被禁用";
-    }
-    [bar addSubview:detail];
-    
-    // 激活/管理 按钮（右侧）
-    UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.frame = CGRectMake(w-80, 10, 66, 36);
-    [btn setTitle:active ? @"管理" : @"激活" forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
-    btn.backgroundColor = active
-        ? [UIColor colorWithRed:0.20 green:0.65 blue:0.35 alpha:1]
-        : [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1];
-    [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    btn.layer.cornerRadius = 8;
-    [btn addTarget:self action:@selector(activationTapped) forControlEvents:UIControlEventTouchUpInside];
-    [bar addSubview:btn];
-    
-    // === 未激活时：UDID 显示 + 复制 ===
-    if (!active && udid.length) {
-        // "设备 UDID:" 标签
-        UILabel *udidLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, 52, 80, 18)];
-        udidLabel.font = [UIFont systemFontOfSize:12];
-        udidLabel.textColor = [UIColor darkGrayColor];
-        udidLabel.text = @"设备 UDID:";
-        [bar addSubview:udidLabel];
-        
-        // UDID 值（截断显示）
-        NSString *shortUdid = udid.length > 16
-            ? [NSString stringWithFormat:@"%@...%@",
-               [udid substringToIndex:8],
-               [udid substringFromIndex:udid.length-6]]
-            : udid;
-        UILabel *udidVal = [[UILabel alloc] initWithFrame:CGRectMake(90, 52, w-170, 18)];
-        udidVal.font = [UIFont fontWithName:@"Menlo" size:11];
-        udidVal.textColor = [UIColor colorWithRed:0.3 green:0.3 blue:0.3 alpha:1];
-        udidVal.text = shortUdid;
-        udidVal.lineBreakMode = NSLineBreakByTruncatingMiddle;
-        [bar addSubview:udidVal];
-        
-        // 复制按钮
-        UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
-        copyBtn.frame = CGRectMake(w-60, 50, 46, 22);
-        [copyBtn setTitle:@"复制" forState:UIControlStateNormal];
-        copyBtn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
-        [copyBtn setTitleColor:[UIColor colorWithRed:0.20 green:0.55 blue:0.95 alpha:1] forState:UIControlStateNormal];
-        copyBtn.tag = 9999;
-        [copyBtn addTarget:self action:@selector(udidCopyTapped) forControlEvents:UIControlEventTouchUpInside];
-        [bar addSubview:copyBtn];
-        
-        // 提示文字
-        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(14, 74, w-28, 14)];
-        hint.font = [UIFont systemFontOfSize:11];
-        hint.textColor = [UIColor colorWithRed:0.55 green:0.55 blue:0.60 alpha:1];
-        hint.text = @"把 UDID 发给卖家，让他给你发激活卡密";
-        [bar addSubview:hint];
-    }
-    
-    UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, h + 8)];
-    [header addSubview:bar];
-    bar.translatesAutoresizingMaskIntoConstraints = NO;
-    [NSLayoutConstraint activateConstraints:@[
-        [bar.topAnchor constraintEqualToAnchor:header.topAnchor constant:4],
-        [bar.leadingAnchor constraintEqualToAnchor:header.leadingAnchor constant:16],
-        [bar.trailingAnchor constraintEqualToAnchor:header.trailingAnchor constant:-16],
-        [bar.heightAnchor constraintEqualToConstant:h],
-    ]];
-    for (UIView *v in self.view.subviews) {
-        if ([v isKindOfClass:[UITableView class]]) {
-            ((UITableView *)v).tableHeaderView = header;
-            break;
-        }
-    }
-    _ntmLocked = !active;
-    [self NTM_applyLock];
-    [self reloadList];
-}
-
-- (void)udidCopyTapped {
-    NSString *udid = [self NTM_readUDID];
-    if (udid.length) {
-        [UIPasteboard generalPasteboard].string = udid;
-        [self toast:@"UDID 已复制，发给卖家即可"];
-    } else {
-        [self toast:@"读不到 UDID"];
-    }
-}
-
-// 递归 disable/enable UIControl，但跳过激活横幅（tag=8888 的父视图内的控件不禁用）
 - (void)NTM_applyLock {
     BOOL lock = _ntmLocked;
     self.navigationItem.rightBarButtonItem.enabled = !lock;
-    // 顶部控件（不走 header，避免误伤激活横幅里的按钮）
     _catSeg.enabled = !lock;
     _filterSeg.enabled = !lock;
     _searchBar.userInteractionEnabled = !lock;
     _selEntryBtn.enabled = !lock;
     _autoAuthSwitch.enabled = !lock;
     _tableView.userInteractionEnabled = !lock;
-    if (_topRow)  [self NTM_disableControlsIn:_topRow  locked:lock skipTag:8888];
-    if (_editCol) [self NTM_disableControlsIn:_editCol locked:lock skipTag:8888];
-    if (_headCol) [self NTM_disableControlsIn:_headCol locked:lock skipTag:8888];
+    if (_topRow)  [self NTM_disableControlsIn:_topRow  locked:lock];
+    if (_editCol) [self NTM_disableControlsIn:_editCol locked:lock];
+    if (_headCol) [self NTM_disableControlsIn:_headCol locked:lock];
 }
 
-- (void)NTM_disableControlsIn:(UIView *)view locked:(BOOL)lock skipTag:(NSInteger)skipTag {
-    // 如果当前 view 就是 skipTag，跳过它的所有子控件
-    if (view.tag == skipTag) return;
+- (void)NTM_disableControlsIn:(UIView *)view locked:(BOOL)lock {
     for (UIView *sub in view.subviews) {
-        if (sub.tag == skipTag) continue;  // 跳过 skipTag 容器
         if ([sub isKindOfClass:[UIControl class]]) {
             ((UIControl *)sub).enabled = !lock;
         }
-        [self NTM_disableControlsIn:sub locked:lock skipTag:skipTag];
+        [self NTM_disableControlsIn:sub locked:lock];
     }
-}
-
-// 旧签名兼容（不带 skipTag）
-- (void)NTM_disableControlsIn:(UIView *)view locked:(BOOL)lock {
-    [self NTM_disableControlsIn:view locked:lock skipTag:0];
-}
-
-- (void)activationTapped {
-    NSUserDefaults *d = NTM_prefs();
-    NSString *key = [d stringForKey:@"NTM_activation_key"];
-    NSString *udid = [self NTM_readUDID];
-    
-    UIAlertController *ac = [UIAlertController alertControllerWithTitle:@"🔑 卡密激活"
-        message:[NSString stringWithFormat:@"当前设备 UDID: %@\n\n输入卡密激活（将自动绑定此设备）", udid.length > 16 ? [[udid substringToIndex:8] stringByAppendingFormat:@"...%@", [udid substringFromIndex:udid.length-6]] : udid]
-        preferredStyle:UIAlertControllerStyleAlert];
-    [ac addTextFieldWithConfigurationHandler:^(UITextField *tf) {
-        tf.secureTextEntry = YES;
-        tf.placeholder = @"输入卡密";
-        tf.text = key;
-        tf.font = [UIFont fontWithName:@"Menlo" size:14];
-    }];
-    [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
-        [d removeObjectForKey:@"NTM_activation_key"];
-        [d removeObjectForKey:@"NTM_verify_expires"];
-        [d removeObjectForKey:@"NTM_verify_udid"];
-        [d synchronize];
-        [self toast:@"已清除卡密"];
-        [self refreshActivationBar];
-    }]];
-    [ac addAction:[UIAlertAction actionWithTitle:@"验证并保存" style:UIAlertActionStyleDefault handler:^(UIAlertAction *a) {
-        NSString *newKey = [ac.textFields[0].text stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
-        if (newKey.length == 0) {
-            [self toast:@"卡密不能为空"];
-            return;
-        }
-        [self toast:@"正在验证..."];
-        // 同步请求 verify.php（超时 10s）
-        NSString *urlStr = [NSString stringWithFormat:@"http://101.200.189.251/verify.php?key=%@&udid=%@",
-                            [newKey stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]],
-                            [udid  stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
-        NSURLRequest *req = [NSURLRequest requestWithURL:[NSURL URLWithString:urlStr]
-                                             cachePolicy:NSURLRequestReloadIgnoringLocalAndRemoteCacheData
-                                         timeoutInterval:10];
-        NSURLResponse *resp = nil; NSError *err = nil;
-        NSData *data = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:&err];
-        if (err || !data) {
-            [self toast:[NSString stringWithFormat:@"网络错误：%@", err.localizedDescription ?: @"无响应"]];
-            return;
-        }
-        NSError *je = nil;
-        id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&je];
-        if (je || ![json isKindOfClass:[NSDictionary class]]) {
-            NSString *raw = [[NSString alloc] initWithData:data encoding:NSUTF8StringEncoding] ?: @"";
-            [self toast:[NSString stringWithFormat:@"服务器返回异常：%@", raw.length > 40 ? [raw substringToIndex:40] : raw]];
-            return;
-        }
-        BOOL ok = [json[@"ok"] boolValue];
-        BOOL valid = [json[@"valid"] boolValue];
-        if (!ok || !valid) {
-            NSString *reason = json[@"reason"] ?: @"未知错误";
-            NSString *msg;
-            if ([reason isEqualToString:@"invalid"])       msg = @"❌ 卡密无效";
-            else if ([reason isEqualToString:@"expired"])   msg = @"❌ 卡密已过期";
-            else if ([reason isEqualToString:@"udid_mismatch"]) msg = @"❌ 此卡密已绑定其他设备";
-            else if ([reason isEqualToString:@"missing_key"]) msg = @"❌ 卡密为空";
-            else msg = [NSString stringWithFormat:@"❌ 验证失败：%@", reason];
-            [self toast:msg];
-            return;
-        }
-        // ✅ 验证通过！存卡密 + 存 expires + 存 udid
-        [d setObject:newKey forKey:@"NTM_activation_key"];
-        [d setObject:udid   forKey:@"NTM_verify_udid"];
-        // 服务器返回的 expires 解析 + 7 天宽限期（和 Tweak.m init() 对齐）
-        NSString *expStr = json[@"expires"];
-        NSDate *expDate = nil;
-        if (expStr && ![expStr isEqualToString:@"永久"]) {
-            static NSDateFormatter *fm = nil;
-            if (!fm) { fm = [[NSDateFormatter alloc] init]; fm.locale = [NSLocale localeWithLocaleIdentifier:@"en_US_POSIX"]; }
-            fm.dateFormat = @"yyyy-MM-dd HH:mm:ss";
-            expDate = [fm dateFromString:expStr];
-            if (expDate) expDate = [expDate dateByAddingTimeInterval:7*86400];  // +7 天缓冲
-        } else {
-            expDate = [NSDate dateWithTimeIntervalSinceNow:365*86400];  // 永久：给 1 年
-        }
-        if (expDate) [d setObject:expDate forKey:@"NTM_verify_expires"];
-        [d synchronize];
-        
-        // 发 Darwin 通知让 SpringBoard 那边也知道
-        CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(),
-            (CFNotificationName)@"com.ntm.notifymanager.activationChanged",
-            NULL, NULL, YES);
-        CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(),
-            (CFNotificationName)@"com.ntm.notifymanager.needRestart",
-            NULL, NULL, YES);
-        
-        [self toast:@"✅ 验证通过！重启设置生效"];
-        [self refreshActivationBar];
-    }]];
-    [self presentViewController:ac animated:YES completion:nil];
 }
 
 void NTMNotifyCallback(CFNotificationCenterRef center, void *observer, CFNotificationName name, const void *object, CFDictionaryRef userInfo) {
