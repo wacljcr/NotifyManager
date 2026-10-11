@@ -632,12 +632,12 @@ __attribute__((constructor)) static void init() {
                                         CFSTR("com.ntm.notifymanager.activationChanged"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
         
-        // 如果没验证通过，发异步请求验证服务器（不阻塞启动）— 旧 API
+        // 如果没验证通过，发异步请求验证服务器（不阻塞启动）— 正确 API
         if (!verified && savedKey.length) {
             NSString *udidStr = udid ?: @"";
             NSString *body = [NSString stringWithFormat:
-                @"action=verify&key=%@&device_id=%@&tweak_id=com.ntm.notifymanager",
-                savedKey, udidStr];
+                @"action=verify&device_id=%@&tweak_id=com.ntm.notifymanager",
+                udidStr];
             NSMutableURLRequest *vreq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"http://101.200.189.251/verify.php"]];
             vreq.HTTPMethod = @"POST";
             vreq.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
@@ -650,8 +650,14 @@ __attribute__((constructor)) static void init() {
                         id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
                         if ([json isKindOfClass:[NSDictionary class]] && [json[@"authorized"] boolValue]) {
                             NSUserDefaults *dd = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
-                            // 旧 API 没给 expires，存 37 天（30+7缓冲）
-                            [dd setObject:[[NSDate date] dateByAddingTimeInterval:(30+7)*86400] forKey:@"NTM_verify_expires"];
+                            NSNumber *expiryNum = json[@"expiry"];
+                            NSDate *expDate;
+                            if (expiryNum && [expiryNum longLongValue] > 0) {
+                                expDate = [[NSDate dateWithTimeIntervalSince1970:[expiryNum doubleValue]] dateByAddingTimeInterval:7*86400];
+                            } else {
+                                expDate = [[NSDate date] dateByAddingTimeInterval:365*86400];
+                            }
+                            [dd setObject:expDate forKey:@"NTM_verify_expires"];
                             [dd setObject:udidStr forKey:@"NTM_verify_udid"];
                             [dd synchronize];
                             CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),

@@ -2193,9 +2193,9 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     [_spinner startAnimating];
     _keyField.enabled = NO;
     
-    // 旧 API: POST verify.php  action=verify&key=X&device_id=X&tweak_id=X
+    // 正确 API（license-system/server）: POST verify.php  action=activate&card_key=X&device_id=X&tweak_id=X
     NSString *body = [NSString stringWithFormat:
-        @"action=verify&key=%@&device_id=%@&tweak_id=com.ntm.notifymanager",
+        @"action=activate&card_key=%@&device_id=%@&tweak_id=com.ntm.notifymanager",
         [newKey   stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]],
         [udidStr  stringByAddingPercentEncodingWithAllowedCharacters:[NSCharacterSet URLQueryAllowedCharacterSet]]];
     NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"http://101.200.189.251/verify.php"]];
@@ -2227,16 +2227,25 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     NSString *message = json[@"message"] ?: @"";
     
     if (!authorized) {
-        NSString *msg = [NSString stringWithFormat:@"❌ %@", message.length ? message : @"验证失败"];
+        NSString *msg = [NSString stringWithFormat:@"❌ %@", message.length ? message : @"激活失败"];
         [self flashError:msg];
         return;
     }
     
-    // OK! 旧 API 没给 expires，我们给 30 天（+7 缓冲 = 37 天）
+    // OK! 从服务器拿 expiry（Unix 时间戳），转成 NSDate
     NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"com.ntm.notifymanager"];
     [d setObject:newKey forKey:@"NTM_activation_key"];
     [d setObject:udidStr forKey:@"NTM_verify_udid"];
-    NSDate *expDate = [NSDate dateWithTimeIntervalSinceNow:(30+7)*86400];
+    NSNumber *expiryNum = json[@"expiry"];
+    NSDate *expDate = nil;
+    if (expiryNum && [expiryNum longLongValue] > 0) {
+        expDate = [NSDate dateWithTimeIntervalSince1970:[expiryNum doubleValue]];
+        // +7 天宽限期
+        expDate = [expDate dateByAddingTimeInterval:7*86400];
+    } else {
+        // expiry=0 表示永久 → 给 1 年缓冲
+        expDate = [NSDate dateWithTimeIntervalSinceNow:365*86400];
+    }
     [d setObject:expDate forKey:@"NTM_verify_expires"];
     [d synchronize];
     
