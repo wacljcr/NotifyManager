@@ -599,8 +599,12 @@ static void tryHookMeta(Class cls, SEL sel, IMP hook, IMP *orig) {
     method_setImplementation(m, hook);
 }
 
-// ===== 2.3.24 验证核心（抄 CallAssist 架构：每 hook 入口验，非 init 一次性验）=====
-static NSTimeInterval g_lastBgCheck = 0;
+// ===== 2.3.24 验证核心（抄 CallAssist 架构：每 hook 入口同步验服务器）=====
+// 秒拉黑秒解封：每次 NTM_isAuthorized 直接请求 verify.php
+// 加 10 秒内存缓存（g_cachedAuth）减少频繁网络请求，但不影响秒级响应
+static BOOL g_cachedAuth = NO;
+static NSTimeInterval g_cacheTime = 0;
+static NSString *g_cacheUDID = nil;
 
 static inline NSString *NTM_readUdid(void) {
     NSString *udid = nil;
@@ -613,80 +617,64 @@ static inline NSString *NTM_readUdid(void) {
     return udid;
 }
 
-// 后台异步查服务器（不阻塞 hook 调用，30 秒一次）
-static void NTM_bgRefresh(void) {
-    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-    if (now - g_lastBgCheck < 30) return; // 节流：30 秒
-    g_lastBgCheck = now;
-    
-    NSDictionary *lic = NTM_readLicense();
-    NSString *savedKey = lic[@"activation_key"];
-    if (!savedKey.length) return;
-    
-    NSString *udidStr = NTM_readUdid() ?: @"";
-    NSString *body = [NSString stringWithFormat:
-        @"action=verify&device_id=%@&tweak_id=com.ntm.notifymanager", udidStr];
-    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"http://101.200.189.251/verify.php"]];
-    req.HTTPMethod = @"POST";
-    req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
-    [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
-    req.timeoutInterval = 8;
-    
-    // GCD：全局后台队列里同步请求（不阻塞主/当前线程）
-    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
-        NSURLResponse *resp = nil;
-        NSError *nsErr = nil;
-        NSData *respData = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:&nsErr];
-        if (!nsErr && respData) {
-            @autoreleasepool {
-                id jsonObj = [NSJSONSerialization JSONObjectWithData:respData options:0 error:nil];
-                if ([jsonObj isKindOfClass:[NSDictionary class]]) {
-                    NSDictionary *j = (NSDictionary *)jsonObj;
-                    BOOL ok = [j[@"authorized"] boolValue];
-                    if (!ok) {
-                        // 服务器说 NO → 吊销/过期！删公共 JSON！
-                        fprintf(stderr, "[NTM bg] verify.php 返回 false → NTM_writeLicense(nil)\n");
-                        NTM_writeLicense(nil);
-                    }
-                }
-            }
+// 秒级验证：直接请求服务器，缓存 10 秒
+static BOOL NTM_checkWithServer(void) {
+    @autoreleasepool {
+        NSString *udid = NTM_readUdid();
+        if (!udid.length) return NO;
+        
+        // 10 秒内存缓存（同 UDID 才复用）
+        NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+        if (now - g_cacheTime < 10 && g_cachedAuth && [g_cacheUDID isEqualToString:udid]) {
+            return YES;  // ✅ 缓存命中，秒级
         }
-        // nsErr 或 !respData → 服务器不可达 → 不动缓存（离线宽限继续）
-    });
+        
+        NSString *body = [NSString stringWithFormat:
+            @"action=verify&device_id=%@&tweak_id=com.ntm.notifymanager", udid];
+        NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"http://101.200.189.251/verify.php"]];
+        req.HTTPMethod = @"POST";
+        req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
+        [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+        req.timeoutInterval = 3;
+        
+        NSURLResponse *resp = nil; NSError *err = nil;
+        NSData *data = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:&err];
+        
+        if (err || !data) {
+            // 服务器超时/挂了 → 用本地缓存（离线宽限）
+            NSDictionary *lic = NTM_readLicense();
+            if (!lic) return NO;
+            NSNumber *expNum = lic[@"verify_expires"];
+            if (!expNum || [expNum doubleValue] < now) return NO;
+            return YES; // 离线宽限
+        }
+        
+        id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+        BOOL ok = [json isKindOfClass:[NSDictionary class]] && [json[@"authorized"] boolValue];
+        
+        // 更新缓存
+        g_cachedAuth = ok;
+        g_cacheTime = now;
+        g_cacheUDID = [udid copy];
+        
+        if (!ok) {
+            // 服务器说 NO → 删所有缓存！
+            NTM_writeLicense(nil);
+        } else {
+            // 服务器说 YES → 更新公共 JSON（保持客户端面板显示已激活）
+            NTM_writeLicense(@{
+                @"activation_key": @"server_confirmed",  // 值不重要，有就行
+                @"verify_expires": @(now + 365*86400),
+                @"verify_udid": udid,
+            });
+        }
+        return ok;
+    }
 }
 
 // 核心：每个 hook 函数入口第一行就调这个
-// 抄 CallAssist 的"每次功能启用前验签"思路
 static inline BOOL NTM_isAuthorized(void) {
-    @autoreleasepool {
-        // 迁移兼容：旧 NSUserDefaults suite → 公共 JSON
-        NTM_migrateFromSuite();
-        
-        NSDictionary *lic = NTM_readLicense();
-        if (!lic) { NTM_bgRefresh(); return NO; }
-        
-        NSString *savedKey = lic[@"activation_key"];
-        if (!savedKey.length) { NTM_bgRefresh(); return NO; }
-        
-        // 检查过期
-        NSNumber *expNum = lic[@"verify_expires"];
-        if (!expNum || [expNum doubleValue] <= 0 || [expNum doubleValue] < [[NSDate date] timeIntervalSince1970]) {
-            NTM_bgRefresh(); return NO;
-        }
-        
-        // UDID 匹配
-        NSString *cachedUdid = lic[@"verify_udid"];
-        if (cachedUdid.length) {
-            NSString *curUdid = NTM_readUdid();
-            if (curUdid.length && ![cachedUdid isEqualToString:curUdid]) {
-                NTM_bgRefresh(); return NO; // 换设备了
-            }
-        }
-        
-        // 本地缓存 OK，后台异步刷新（不阻塞这次调用）
-        NTM_bgRefresh();
-        return YES;
-    }
+    return NTM_checkWithServer();
 }
 
 #pragma mark - 镜像写入：SpringBoard → 各 App 容器（仅 SpringBoard 进程执行）
@@ -786,101 +774,10 @@ __attribute__((constructor)) static void init() {
         [fm createFileAtPath:[prefix stringByAppendingString:@"_start"] contents:nil attributes:nil];
         fprintf(stderr, "[NTM] ===== init() start [%s] =====", procName.UTF8String);
         
-        // ===== 卡密验证（2.3.24 新增，改公共 JSON 解决 rootless 容器隔离）=====
-        NTM_migrateFromSuite(); // 旧 suite → 公共 JSON 迁移
-        NSDictionary *lic = NTM_readLicense();
-        NSString *savedKey = lic[@"activation_key"];
-        NSNumber *verifyExpires = lic[@"verify_expires"];
-        NSString *verifyUdid = lic[@"verify_udid"];
-        
-        char keyBuf[256] = "(nil)";
-        if (savedKey.length) snprintf(keyBuf, sizeof(keyBuf), "%s", savedKey.UTF8String);
-        char expBuf[128] = "(nil)";
-        if (verifyExpires) snprintf(expBuf, sizeof(expBuf), "%.0f", verifyExpires.doubleValue);
-        char udidBuf[64] = "(nil)";
-        if (verifyUdid.length) snprintf(udidBuf, sizeof(udidBuf), "%s", verifyUdid.UTF8String);
-        fprintf(stderr, "[NTM] savedKey=%s expires=%s udid_cached=%s path=%s",
-                keyBuf, expBuf, udidBuf, [NTM_licensePath() UTF8String]);
-        
-        // 读 UDID
-        NSString *udid = nil;
-        void *mg = dlopen("/System/Library/PrivateFrameworks/MobileGestalt.framework/MobileGestalt", RTLD_NOW);
-        if (mg) {
-            NSString *(*copyAnswer)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
-            if (copyAnswer) udid = copyAnswer(@"UniqueDeviceID", nil);
-            dlclose(mg);
-        }
-        fprintf(stderr, "[NTM] device UDID=%s", udid ? [udid UTF8String] : "(nil)");
-        
-        BOOL verified = NO;
-        
-        if (savedKey.length) {
-            fprintf(stderr, "[NTM] savedKey found → requesting server verify.php ...");
-            // 同步请求服务器（超时 5 秒，可接受）
-            NSString *udidStr = udid ?: @"";
-            NSString *body = [NSString stringWithFormat:
-                @"action=verify&device_id=%@&tweak_id=com.ntm.notifymanager",
-                udidStr];
-            NSMutableURLRequest *vreq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"http://101.200.189.251/verify.php"]];
-            vreq.HTTPMethod = @"POST";
-            vreq.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
-            [vreq setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
-            vreq.timeoutInterval = 5;
-            
-            NSURLResponse *resp = nil; NSError *serr = nil;
-            NSData *sdata = [NSURLConnection sendSynchronousRequest:vreq returningResponse:&resp error:&serr];
-            
-            if (!serr && sdata) {
-                NSString *respStr = [[NSString alloc] initWithData:sdata encoding:NSUTF8StringEncoding];
-                fprintf(stderr, "[NTM] server response=%s", [respStr UTF8String]);
-                // 服务器可达 → 听服务器的
-                @try {
-                    id json = [NSJSONSerialization JSONObjectWithData:sdata options:0 error:nil];
-                    BOOL auth = [json isKindOfClass:[NSDictionary class]] && [json[@"authorized"] boolValue];
-                    fprintf(stderr, "[NTM] parsed authorized=%d", auth);
-                    if (auth) {
-                        verified = YES;
-                        // 更新公共 JSON 缓存
-                        NSNumber *expiryNum = json[@"expiry"];
-                        NSTimeInterval expTs = 0;
-                        if (expiryNum && [expiryNum longLongValue] > 0) {
-                            expTs = [expiryNum doubleValue] + 7*86400; // +7 天宽限
-                        } else {
-                            expTs = [[NSDate date] timeIntervalSince1970] + 365*86400;
-                        }
-                        NTM_writeLicense(@{
-                            @"activation_key": savedKey,
-                            @"verify_expires": @(expTs),
-                            @"verify_udid": udidStr,
-                        });
-                        fprintf(stderr, "[NTM] ✅ 公共 JSON 已更新\n");
-                    } else {
-                        // 服务器说 NO → 删公共 JSON！
-                        fprintf(stderr, "[NTM] ❌ 服务器拒绝 → NTM_writeLicense(nil)\n");
-                        NTM_writeLicense(nil);
-                    }
-                } @catch (NSException *e) {
-                    fprintf(stderr, "[NTM] JSON parse fail: %s", [e.reason UTF8String]);
-                }
-            } else {
-                fprintf(stderr, "[NTM] server request error: %s", [serr.localizedDescription UTF8String]);
-                // 服务器不可达 → 用本地缓存（离线宽限）
-                NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
-                if (verifyExpires && [verifyExpires doubleValue] > now) {
-                    if (!verifyUdid.length || !udid.length || [verifyUdid isEqualToString:udid]) {
-                        fprintf(stderr, "[NTM] 离线宽限 → verified=YES");
-                        verified = YES;
-                    }
-                }
-            }
-        } else {
-            fprintf(stderr, "[NTM] 无 savedKey → verified=NO（跳过验证请求）");
-        }
-        
-        fprintf(stderr, "[NTM] ===== init verify done, cached verified=%d =====", verified);
-        // init 里的同步验证只负责存/清缓存，不再决定装不装 hook
-        // 每个 hook 函数入口自己调 NTM_isAuthorized() guard —— 抄 CallAssist 架构
-        // tryHook 永远照装
+        // ===== 卡密验证：直接秒级查服务器 =====
+        BOOL verified = NTM_checkWithServer();
+        fprintf(stderr, "[NTM] init verify result=%d (秒级同步服务器)", verified);
+        // tryHook 永远照装，每个 hook 入口 guard —— 抄 CallAssist 架构
         
         // ===== init 通知注册 + 默认配置（不管验证状态）=====
         

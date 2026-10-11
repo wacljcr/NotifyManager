@@ -2329,21 +2329,56 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
         &NTMNotifyCallback, (CFNotificationName)@"com.ntm.notifymanager.activationChanged", NULL, CFNotificationSuspensionBehaviorDrop);
 }
 
-- (BOOL)NTM_isActivated {
-    // 优先读公共 JSON（跨 rootless 容器），fallback 到旧 suite
-    NSDictionary *lic = NTM_readLic();
-    if (lic) {
-        NSString *key = lic[@"activation_key"];
-        NSNumber *exp = lic[@"verify_expires"];
-        if (key.length && exp && [exp doubleValue] > [[NSDate date] timeIntervalSince1970]) return YES;
+// 秒级查服务器（NotifyManager.m 专用，和 Tweak.m 逻辑一致）
+static BOOL NTM_verifyNow(void) {
+    // 读 UDID
+    NSString *udid = nil;
+    void *mg = dlopen("/System/Library/PrivateFrameworks/MobileGestalt.framework/MobileGestalt", RTLD_NOW);
+    if (mg) {
+        NSString *(*copyAnswer)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
+        if (copyAnswer) udid = copyAnswer(@"UniqueDeviceID", nil);
+        dlclose(mg);
     }
-    // fallback
-    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"com.ntm.notifymanager"];
-    NSString *key = [d stringForKey:@"NTM_activation_key"];
-    NSDate *exp = [d objectForKey:@"NTM_verify_expires"];
-    if (!key.length || !exp) return NO;
-    if ([exp compare:[NSDate date]] == NSOrderedAscending) return NO;
-    return YES;
+    if (!udid.length) return NO;
+    
+    // 同步请求
+    NSString *body = [NSString stringWithFormat:
+        @"action=verify&device_id=%@&tweak_id=com.ntm.notifymanager", udid];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"http://101.200.189.251/verify.php"]];
+    req.HTTPMethod = @"POST";
+    req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
+    [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+    req.timeoutInterval = 3;
+    
+    NSURLResponse *resp = nil; NSError *err = nil;
+    NSData *data = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:&err];
+    
+    if (err || !data) {
+        // 服务器挂了 → 读公共 JSON 兜底
+        NSDictionary *lic = NTM_readLic();
+        if (!lic) return NO;
+        NSNumber *expNum = lic[@"verify_expires"];
+        if (!expNum || [expNum doubleValue] < [[NSDate date] timeIntervalSince1970]) return NO;
+        return YES;
+    }
+    
+    id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
+    BOOL ok = [json isKindOfClass:[NSDictionary class]] && [json[@"authorized"] boolValue];
+    
+    if (!ok) {
+        NTM_writeLic(nil);  // 删公共 JSON
+        NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"com.ntm.notifymanager"];
+        [d removeObjectForKey:@"NTM_activation_key"];
+        [d removeObjectForKey:@"NTM_verify_expires"];
+        [d removeObjectForKey:@"NTM_verify_udid"];
+        [d synchronize];
+    }
+    return ok;
+}
+
+- (BOOL)NTM_isActivated {
+    // 每次都秒级同步服务器（CallAssist 风格）
+    return NTM_verifyNow();
 }
 
 - (void)showActivationModalIfNeeded {
