@@ -599,7 +599,7 @@ static void NTM_scheduleMirror(void) {
 __attribute__((constructor)) static void init() {
     @autoreleasepool {
         // ===== 卡密验证（2.3.24 新增）=====
-        // 读取保存的激活码
+        // 权威来源 = 服务器 verify.php；本地缓存 = 离线宽限（服务器不可达时用）
         NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
         NSString *savedKey = [d stringForKey:@"NTM_activation_key"];
         NSDate *verifyExpires = [d objectForKey:@"NTM_verify_expires"];
@@ -614,26 +614,10 @@ __attribute__((constructor)) static void init() {
             dlclose(mg);
         }
         
-        // 判断验证状态
         BOOL verified = NO;
-        if (savedKey.length && verifyExpires) {
-            // 本地有缓存 + 未过期
-            if ([verifyExpires compare:[NSDate date]] != NSOrderedAscending) {
-                // UDID 匹配（如果之前绑定过）
-                if (!verifyUdid.length || !udid.length || [verifyUdid isEqualToString:udid]) {
-                    verified = YES;
-                }
-            }
-        }
         
-        // 设置面板改了卡密 → 重新验证
-        CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                        NULL, NTM_cacheInvalidated,
-                                        CFSTR("com.ntm.notifymanager.activationChanged"),
-                                        NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-        
-        // 如果没验证通过，发异步请求验证服务器（不阻塞启动）— 正确 API
-        if (!verified && savedKey.length) {
+        if (savedKey.length) {
+            // 同步请求服务器（超时 5 秒，可接受）
             NSString *udidStr = udid ?: @"";
             NSString *body = [NSString stringWithFormat:
                 @"action=verify&device_id=%@&tweak_id=com.ntm.notifymanager",
@@ -642,35 +626,46 @@ __attribute__((constructor)) static void init() {
             vreq.HTTPMethod = @"POST";
             vreq.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
             [vreq setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
-            vreq.timeoutInterval = 8;
-            [NSURLConnection sendAsynchronousRequest:vreq queue:[NSOperationQueue mainQueue]
-                                  completionHandler:^(NSURLResponse *resp, NSData *data, NSError *err) {
-                if (!err && data) {
-                    @try {
-                        id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:nil];
-                        if ([json isKindOfClass:[NSDictionary class]] && [json[@"authorized"] boolValue]) {
-                            NSUserDefaults *dd = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
-                            NSNumber *expiryNum = json[@"expiry"];
-                            NSDate *expDate;
-                            if (expiryNum && [expiryNum longLongValue] > 0) {
-                                expDate = [[NSDate dateWithTimeIntervalSince1970:[expiryNum doubleValue]] dateByAddingTimeInterval:7*86400];
-                            } else {
-                                expDate = [[NSDate date] dateByAddingTimeInterval:365*86400];
-                            }
-                            [dd setObject:expDate forKey:@"NTM_verify_expires"];
-                            [dd setObject:udidStr forKey:@"NTM_verify_udid"];
-                            [dd synchronize];
-                            CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                CFSTR("com.ntm.notifymanager.verifyResult"), NULL,
-                                (__bridge CFDictionaryRef)@{@"valid": @YES}, YES);
+            vreq.timeoutInterval = 5;
+            
+            NSURLResponse *resp = nil; NSError *serr = nil;
+            NSData *sdata = [NSURLConnection sendSynchronousRequest:vreq returningResponse:&resp error:&serr];
+            
+            if (!serr && sdata) {
+                // 服务器可达 → 听服务器的
+                @try {
+                    id json = [NSJSONSerialization JSONObjectWithData:sdata options:0 error:nil];
+                    if ([json isKindOfClass:[NSDictionary class]] && [json[@"authorized"] boolValue]) {
+                        verified = YES;
+                        // 更新本地缓存
+                        NSNumber *expiryNum = json[@"expiry"];
+                        NSDate *expDate;
+                        if (expiryNum && [expiryNum longLongValue] > 0) {
+                            expDate = [[NSDate dateWithTimeIntervalSince1970:[expiryNum doubleValue]] dateByAddingTimeInterval:7*86400];
                         } else {
-                            CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                                CFSTR("com.ntm.notifymanager.verifyResult"), NULL,
-                                (__bridge CFDictionaryRef)@{@"valid": @NO}, YES);
+                            expDate = [[NSDate date] dateByAddingTimeInterval:365*86400];
                         }
-                    } @catch (NSException *e) {}
+                        [d setObject:expDate forKey:@"NTM_verify_expires"];
+                        [d setObject:udidStr forKey:@"NTM_verify_udid"];
+                        [d synchronize];
+                    } else {
+                        // 服务器说 NO → 吊销/过期！清缓存！
+                        [d removeObjectForKey:@"NTM_activation_key"];
+                        [d removeObjectForKey:@"NTM_verify_expires"];
+                        [d removeObjectForKey:@"NTM_verify_udid"];
+                        [d synchronize];
+                    }
+                } @catch (NSException *e) {
+                    // JSON 解析失败 → 用本地缓存（离线宽限）
                 }
-            }];
+            } else {
+                // 服务器不可达（网络断开/超时）→ 用本地缓存（离线宽限）
+                if (verifyExpires && [verifyExpires compare:[NSDate date]] != NSOrderedAscending) {
+                    if (!verifyUdid.length || !udid.length || [verifyUdid isEqualToString:udid]) {
+                        verified = YES; // 离线宽限内
+                    }
+                }
+            }
         }
         
         // 未验证通过 → 跳过所有 hooks（功能等于没装）
