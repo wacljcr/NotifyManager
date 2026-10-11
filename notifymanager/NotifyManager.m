@@ -876,6 +876,7 @@ static UIButton *NTM_actionTag(NSString *text, UIColor *color) {
     BOOL _editing;          // 是否多选批量模式
     NSMutableSet *_selected; // 多选模式下选中的 appId
     UISwitch *_autoAuthSwitch; // 全局：自动授权通知权限
+    BOOL _ntmLocked;          // 2.3.24 卡密未激活 = YES
 }
 
 - (void)setRootController:(id)rootController {}
@@ -932,6 +933,7 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
 }
 
 - (void)autoAuthChanged {
+    if (_ntmLocked) { [self toast:@"请先激活卡密"]; return; }
     [NTM_prefs() setBool:_autoAuthSwitch.on forKey:@"NTM_autoAuth"];
     [NTM_prefs() synchronize];
     NTM_postConfigChanged();
@@ -1921,6 +1923,15 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     [self refreshActivationBar];
 }
 
+- (NSString *)NTM_readUDID {
+    void *mg = dlopen("/System/Library/PrivateFrameworks/MobileGestalt.framework/MobileGestalt", RTLD_NOW);
+    if (!mg) return @"";
+    NSString *(*copyAnswer)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
+    NSString *udid = copyAnswer ? copyAnswer(@"UniqueDeviceID", nil) : @"";
+    dlclose(mg);
+    return udid ?: @"";
+}
+
 - (void)refreshActivationBar {
     static UIView *bar = nil;
     if (bar) { [bar removeFromSuperview]; bar = nil; }
@@ -1929,43 +1940,91 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     NSString *key = [d stringForKey:@"NTM_activation_key"];
     NSDate *exp = [d objectForKey:@"NTM_verify_expires"];
     BOOL active = key.length && exp && [exp compare:[NSDate date]] != NSOrderedAscending;
+    NSString *udid = [self NTM_readUDID];
     
     CGFloat w = self.view.bounds.size.width - 32;
-    CGFloat h = 76;
+    CGFloat h = active ? 76 : 130;  // 未激活时高一点（放 UDID 行）
     bar = [[UIView alloc] initWithFrame:CGRectMake(16, 0, w, h)];
     bar.backgroundColor = active
         ? [UIColor colorWithRed:0.88 green:0.96 blue:0.90 alpha:1]
         : [UIColor colorWithRed:1.0 green:0.92 blue:0.82 alpha:1];
     bar.layer.cornerRadius = 12;
     
-    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14, 8, w-28, 22)];
+    // 🔑 标题
+    UILabel *title = [[UILabel alloc] initWithFrame:CGRectMake(14, 6, w-100, 22)];
     title.font = [UIFont boldSystemFontOfSize:15];
     title.text = active ? @"✅ 已激活" : @"🔑 卡密激活";
-    title.textColor = active ? [UIColor colorWithRed:0.13 green:0.55 blue:0.24 alpha:1] : [UIColor colorWithRed:0.85 green:0.40 blue:0.10 alpha:1];
+    title.textColor = active
+        ? [UIColor colorWithRed:0.13 green:0.55 blue:0.24 alpha:1]
+        : [UIColor colorWithRed:0.85 green:0.40 blue:0.10 alpha:1];
     [bar addSubview:title];
     
-    UILabel *detail = [[UILabel alloc] initWithFrame:CGRectMake(14, 30, w-100, 22)];
-    detail.font = [UIFont systemFontOfSize:13];
+    // 详情（激活状态 / 过期时间）
+    UILabel *detail = [[UILabel alloc] initWithFrame:CGRectMake(14, 28, w-100, 18)];
+    detail.font = [UIFont systemFontOfSize:12];
     detail.textColor = [UIColor grayColor];
     if (active) {
         NSDateFormatter *f = [[NSDateFormatter alloc] init];
         f.dateFormat = @"yyyy-MM-dd";
-        NSDate *real = [NSDate dateWithTimeIntervalSinceNow:-7*86400]; // 减掉 7 天宽限期
+        NSDate *real = [NSDate dateWithTimeIntervalSinceNow:-7*86400];
         detail.text = [NSString stringWithFormat:@"有效期至 %@", [f stringFromDate:real]];
     } else {
         detail.text = key.length ? @"验证中或已过期..." : @"未输入卡密，插件功能会被禁用";
     }
     [bar addSubview:detail];
     
+    // 激活/管理 按钮（右侧）
     UIButton *btn = [UIButton buttonWithType:UIButtonTypeSystem];
-    btn.frame = CGRectMake(w-80, 16, 66, 44);
+    btn.frame = CGRectMake(w-80, 10, 66, 36);
     [btn setTitle:active ? @"管理" : @"激活" forState:UIControlStateNormal];
-    btn.titleLabel.font = [UIFont boldSystemFontOfSize:15];
-    btn.backgroundColor = active ? [UIColor colorWithRed:0.20 green:0.65 blue:0.35 alpha:1] : [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1];
+    btn.titleLabel.font = [UIFont boldSystemFontOfSize:14];
+    btn.backgroundColor = active
+        ? [UIColor colorWithRed:0.20 green:0.65 blue:0.35 alpha:1]
+        : [UIColor colorWithRed:0.95 green:0.55 blue:0.15 alpha:1];
     [btn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
-    btn.layer.cornerRadius = 10;
+    btn.layer.cornerRadius = 8;
     [btn addTarget:self action:@selector(activationTapped) forControlEvents:UIControlEventTouchUpInside];
     [bar addSubview:btn];
+    
+    // === 未激活时：UDID 显示 + 复制 ===
+    if (!active && udid.length) {
+        // "设备 UDID:" 标签
+        UILabel *udidLabel = [[UILabel alloc] initWithFrame:CGRectMake(14, 52, 80, 18)];
+        udidLabel.font = [UIFont systemFontOfSize:12];
+        udidLabel.textColor = [UIColor darkGrayColor];
+        udidLabel.text = @"设备 UDID:";
+        [bar addSubview:udidLabel];
+        
+        // UDID 值（截断显示）
+        NSString *shortUdid = udid.length > 16
+            ? [NSString stringWithFormat:@"%@...%@",
+               [udid substringToIndex:8],
+               [udid substringFromIndex:udid.length-6]]
+            : udid;
+        UILabel *udidVal = [[UILabel alloc] initWithFrame:CGRectMake(90, 52, w-170, 18)];
+        udidVal.font = [UIFont fontWithName:@"Menlo" size:11];
+        udidVal.textColor = [UIColor colorWithRed:0.3 green:0.3 blue:0.3 alpha:1];
+        udidVal.text = shortUdid;
+        udidVal.lineBreakMode = NSLineBreakByTruncatingMiddle;
+        [bar addSubview:udidVal];
+        
+        // 复制按钮
+        UIButton *copyBtn = [UIButton buttonWithType:UIButtonTypeSystem];
+        copyBtn.frame = CGRectMake(w-60, 50, 46, 22);
+        [copyBtn setTitle:@"复制" forState:UIControlStateNormal];
+        copyBtn.titleLabel.font = [UIFont systemFontOfSize:12 weight:UIFontWeightMedium];
+        [copyBtn setTitleColor:[UIColor colorWithRed:0.20 green:0.55 blue:0.95 alpha:1] forState:UIControlStateNormal];
+        copyBtn.tag = 9999;
+        [copyBtn addTarget:self action:@selector(udidCopyTapped) forControlEvents:UIControlEventTouchUpInside];
+        [bar addSubview:copyBtn];
+        
+        // 提示文字
+        UILabel *hint = [[UILabel alloc] initWithFrame:CGRectMake(14, 74, w-28, 14)];
+        hint.font = [UIFont systemFontOfSize:11];
+        hint.textColor = [UIColor colorWithRed:0.55 green:0.55 blue:0.60 alpha:1];
+        hint.text = @"把 UDID 发给卖家，让他给你发激活卡密";
+        [bar addSubview:hint];
+    }
     
     UIView *header = [[UIView alloc] initWithFrame:CGRectMake(0, 0, self.view.bounds.size.width, h + 8)];
     [header addSubview:bar];
@@ -1982,7 +2041,61 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
             break;
         }
     }
+    _ntmLocked = !active;
+    [self NTM_applyLock];
     [self reloadList];
+}
+
+- (void)udidCopyTapped {
+    NSString *udid = [self NTM_readUDID];
+    if (udid.length) {
+        [UIPasteboard generalPasteboard].string = udid;
+        [self toast:@"UDID 已复制，发给卖家即可"];
+    } else {
+        [self toast:@"读不到 UDID"];
+    }
+}
+
+// 递归 disable/enable 所有 UIControl
+- (void)NTM_applyLock {
+    BOOL lock = _ntmLocked;
+    // 导航栏按钮
+    self.navigationItem.rightBarButtonItem.enabled = !lock;
+    // 顶部 header 里所有控件
+    UIView *header = _tableView.tableHeaderView;
+    if (header) [self NTM_disableControlsIn:header locked:lock];
+    // 分类/过滤/搜索
+    _catSeg.enabled = !lock;
+    _filterSeg.enabled = !lock;
+    _searchBar.userInteractionEnabled = !lock;
+    _selEntryBtn.enabled = !lock;
+    // 全局自动授权开关
+    _autoAuthSwitch.enabled = !lock;
+    // 表格（cell 在 cellForRow 里各自处理）
+    _tableView.userInteractionEnabled = !lock;
+    // 批量操作按钮（topRow/editCol 等）
+    if (_topRow) [self NTM_disableControlsIn:_topRow locked:lock];
+    if (_editCol) [self NTM_disableControlsIn:_editCol locked:lock];
+    if (_headCol) [self NTM_disableControlsIn:_headCol locked:lock];
+}
+
+- (void)NTM_disableControlsIn:(UIView *)view locked:(BOOL)lock {
+    for (UIView *sub in view.subviews) {
+        if ([sub isKindOfClass:[UIControl class]]) {
+            ((UIControl *)sub).enabled = !lock;
+        }
+        [self NTM_disableControlsIn:sub locked:lock];
+    }
+}
+
+// 给 AppCell 用的类方法
+static void NTM_disableAllIn(UIView *v, BOOL lock) {
+    for (UIView *sub in v.subviews) {
+        if ([sub isKindOfClass:[UIControl class]]) {
+            ((UIControl *)sub).enabled = !lock;
+        }
+        NTM_disableAllIn(sub, lock);
+    }
 }
 
 - (void)activationTapped {
