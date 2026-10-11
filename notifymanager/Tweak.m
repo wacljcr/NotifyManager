@@ -56,7 +56,14 @@ static NSDictionary *NTM_readLicense(void) {
 static void NTM_writeLicense(NSDictionary *dict) {
     @autoreleasepool {
         if (!dict) {
+            // 删公共 JSON
             [NSFileManager.defaultManager removeItemAtPath:NTM_licensePath() error:nil];
+            // 🔴 同时删旧 NSUserDefaults suite（NotifyManager.m 的 NTM_isActivated 会 fallback 到旧 suite！）
+            NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
+            [d removeObjectForKey:@"NTM_activation_key"];
+            [d removeObjectForKey:@"NTM_verify_expires"];
+            [d removeObjectForKey:@"NTM_verify_udid"];
+            [d synchronize];
             return;
         }
         NSError *err = nil;
