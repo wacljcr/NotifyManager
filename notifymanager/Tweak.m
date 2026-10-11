@@ -24,6 +24,74 @@ extern void NG_refresh(void);
 
 static NSString *NTM_suiteName = @"com.ntm.notifymanager";
 
+// ===== 2.3.24 激活缓存：用 rootless 公共路径 JSON 文件（跨容器隔离）=====
+// rootless 下 /var/jb/var/mobile/Library/ 所有进程都能读写，解决 Preferences 和 SpringBoard 容器隔离问题
+static NSString *NTM_licensePath(void) {
+    // rootless 路径优先；如果不存在用原版路径（非 rootless 兼容）
+    static NSString *p = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        p = @"/var/jb/var/mobile/Library/NTM_license.json";
+        // 确保目录存在
+        [[NSFileManager defaultManager] createDirectoryAtPath:[p stringByDeletingLastPathComponent]
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+    });
+    return p;
+}
+
+// 读激活缓存：返回 dict 或 nil
+static NSDictionary *NTM_readLicense(void) {
+    @autoreleasepool {
+        NSString *path = NTM_licensePath();
+        NSData *data = [NSData dataWithContentsOfFile:path];
+        if (!data) return nil;
+        NSError *err = nil;
+        id json = [NSJSONSerialization JSONObjectWithData:data options:0 error:&err];
+        if (err || ![json isKindOfClass:[NSDictionary class]]) return nil;
+        return (NSDictionary *)json;
+    }
+}
+
+// 写激活缓存
+static void NTM_writeLicense(NSDictionary *dict) {
+    @autoreleasepool {
+        if (!dict) {
+            [NSFileManager.defaultManager removeItemAtPath:NTM_licensePath() error:nil];
+            return;
+        }
+        NSError *err = nil;
+        NSData *data = [NSJSONSerialization dataWithJSONObject:dict options:0 error:&err];
+        if (!err) [data writeToFile:NTM_licensePath() atomically:YES];
+    }
+}
+
+static NSString *NTM_prefsFile(void) {
+    // 旧的 NSUserDefaults suite 路径（用于兼容迁移）
+    NSString *home = NSHomeDirectory();
+    return [home stringByAppendingPathComponent:@"Library/Preferences/com.ntm.notifymanager.plist"];
+}
+
+// 迁移：如果公共 JSON 没有但 NSUserDefaults suite 有，迁移过来
+static void NTM_migrateFromSuite(void) {
+    @autoreleasepool {
+        if (NTM_readLicense()) return; // 已有
+        NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
+        NSString *key = [d stringForKey:@"NTM_activation_key"];
+        if (!key.length) return;
+        NSDate *exp = [d objectForKey:@"NTM_verify_expires"];
+        NSString *udid = [d stringForKey:@"NTM_verify_udid"];
+        if (!exp) return;
+        // 迁移到公共 JSON
+        NTM_writeLicense(@{
+            @"activation_key": key ?: @"",
+            @"verify_expires": @([exp timeIntervalSince1970]),
+            @"verify_udid": udid ?: @"",
+        });
+        fprintf(stderr, "[NTM] 迁移 NSUserDefaults → 公共 JSON OK\n");
+    }
+}
+
+
 // 共享 NSUserDefaults 单例，避免每次通知到达都新建实例
 static NSUserDefaults *NTM_prefs(void) {
     static NSUserDefaults *prefs = nil;
@@ -544,8 +612,8 @@ static void NTM_bgRefresh(void) {
     if (now - g_lastBgCheck < 30) return; // 节流：30 秒
     g_lastBgCheck = now;
     
-    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
-    NSString *savedKey = [d stringForKey:@"NTM_activation_key"];
+    NSDictionary *lic = NTM_readLicense();
+    NSString *savedKey = lic[@"activation_key"];
     if (!savedKey.length) return;
     
     NSString *udidStr = NTM_readUdid() ?: @"";
@@ -569,12 +637,9 @@ static void NTM_bgRefresh(void) {
                     NSDictionary *j = (NSDictionary *)jsonObj;
                     BOOL ok = [j[@"authorized"] boolValue];
                     if (!ok) {
-                        // 服务器说 NO → 吊销/过期！清缓存！
-                        NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
-                        [ud removeObjectForKey:@"NTM_activation_key"];
-                        [ud removeObjectForKey:@"NTM_verify_expires"];
-                        [ud removeObjectForKey:@"NTM_verify_udid"];
-                        [ud synchronize];
+                        // 服务器说 NO → 吊销/过期！删公共 JSON！
+                        fprintf(stderr, "[NTM bg] verify.php 返回 false → NTM_writeLicense(nil)\n");
+                        NTM_writeLicense(nil);
                     }
                 }
             }
@@ -587,17 +652,23 @@ static void NTM_bgRefresh(void) {
 // 抄 CallAssist 的"每次功能启用前验签"思路
 static inline BOOL NTM_isAuthorized(void) {
     @autoreleasepool {
-        NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
-        NSString *savedKey = [d stringForKey:@"NTM_activation_key"];
+        // 迁移兼容：旧 NSUserDefaults suite → 公共 JSON
+        NTM_migrateFromSuite();
+        
+        NSDictionary *lic = NTM_readLicense();
+        if (!lic) { NTM_bgRefresh(); return NO; }
+        
+        NSString *savedKey = lic[@"activation_key"];
         if (!savedKey.length) { NTM_bgRefresh(); return NO; }
         
-        NSDate *expires = [d objectForKey:@"NTM_verify_expires"];
-        if (!expires || [expires compare:[NSDate date]] == NSOrderedAscending) {
-            NTM_bgRefresh(); return NO; // 过期了
+        // 检查过期
+        NSNumber *expNum = lic[@"verify_expires"];
+        if (!expNum || [expNum doubleValue] <= 0 || [expNum doubleValue] < [[NSDate date] timeIntervalSince1970]) {
+            NTM_bgRefresh(); return NO;
         }
         
-        // UDID 匹配（如果之前绑定过）
-        NSString *cachedUdid = [d stringForKey:@"NTM_verify_udid"];
+        // UDID 匹配
+        NSString *cachedUdid = lic[@"verify_udid"];
         if (cachedUdid.length) {
             NSString *curUdid = NTM_readUdid();
             if (curUdid.length && ![cachedUdid isEqualToString:curUdid]) {
@@ -708,15 +779,18 @@ __attribute__((constructor)) static void init() {
         [fm createFileAtPath:[prefix stringByAppendingString:@"_start"] contents:nil attributes:nil];
         fprintf(stderr, "[NTM] ===== init() start [%s] =====", procName.UTF8String);
         
-        // ===== 卡密验证（2.3.24 新增）=====
-        NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
-        NSString *savedKey = [d stringForKey:@"NTM_activation_key"];
-        NSDate *verifyExpires = [d objectForKey:@"NTM_verify_expires"];
-        NSString *verifyUdid = [d stringForKey:@"NTM_verify_udid"];
+        // ===== 卡密验证（2.3.24 新增，改公共 JSON 解决 rootless 容器隔离）=====
+        NTM_migrateFromSuite(); // 旧 suite → 公共 JSON 迁移
+        NSDictionary *lic = NTM_readLicense();
+        NSString *savedKey = lic[@"activation_key"];
+        NSNumber *verifyExpires = lic[@"verify_expires"];
+        NSString *verifyUdid = lic[@"verify_udid"];
         
-        fprintf(stderr, "[NTM] savedKey=%s expires=%p udid_cached=%p",
+        fprintf(stderr, "[NTM] savedKey=%s expires=%@ udid_cached=%@ path=%s",
                 savedKey.length ? [savedKey UTF8String] : "(nil)",
-                verifyExpires, verifyUdid);
+                verifyExpires ?: @"(nil)",
+                verifyUdid ?: @"(nil)",
+                [NTM_licensePath() UTF8String]);
         
         // 读 UDID
         NSString *udid = nil;
@@ -756,24 +830,24 @@ __attribute__((constructor)) static void init() {
                     fprintf(stderr, "[NTM] parsed authorized=%d", auth);
                     if (auth) {
                         verified = YES;
-                        // 更新本地缓存
+                        // 更新公共 JSON 缓存
                         NSNumber *expiryNum = json[@"expiry"];
-                        NSDate *expDate;
+                        NSTimeInterval expTs = 0;
                         if (expiryNum && [expiryNum longLongValue] > 0) {
-                            expDate = [[NSDate dateWithTimeIntervalSince1970:[expiryNum doubleValue]] dateByAddingTimeInterval:7*86400];
+                            expTs = [expiryNum doubleValue] + 7*86400; // +7 天宽限
                         } else {
-                            expDate = [[NSDate date] dateByAddingTimeInterval:365*86400];
+                            expTs = [[NSDate date] timeIntervalSince1970] + 365*86400;
                         }
-                        [d setObject:expDate forKey:@"NTM_verify_expires"];
-                        [d setObject:udidStr forKey:@"NTM_verify_udid"];
-                        [d synchronize];
+                        NTM_writeLicense(@{
+                            @"activation_key": savedKey,
+                            @"verify_expires": @(expTs),
+                            @"verify_udid": udidStr,
+                        });
+                        fprintf(stderr, "[NTM] ✅ 公共 JSON 已更新\n");
                     } else {
-                        // 服务器说 NO → 吊销/过期！清缓存！
-                        fprintf(stderr, "[NTM] ❌ 服务器拒绝 → 清本地缓存！");
-                        [d removeObjectForKey:@"NTM_activation_key"];
-                        [d removeObjectForKey:@"NTM_verify_expires"];
-                        [d removeObjectForKey:@"NTM_verify_udid"];
-                        [d synchronize];
+                        // 服务器说 NO → 删公共 JSON！
+                        fprintf(stderr, "[NTM] ❌ 服务器拒绝 → NTM_writeLicense(nil)\n");
+                        NTM_writeLicense(nil);
                     }
                 } @catch (NSException *e) {
                     fprintf(stderr, "[NTM] JSON parse fail: %s", [e.reason UTF8String]);
@@ -781,7 +855,8 @@ __attribute__((constructor)) static void init() {
             } else {
                 fprintf(stderr, "[NTM] server request error: %s", [serr.localizedDescription UTF8String]);
                 // 服务器不可达 → 用本地缓存（离线宽限）
-                if (verifyExpires && [verifyExpires compare:[NSDate date]] != NSOrderedAscending) {
+                NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+                if (verifyExpires && [verifyExpires doubleValue] > now) {
                     if (!verifyUdid.length || !udid.length || [verifyUdid isEqualToString:udid]) {
                         fprintf(stderr, "[NTM] 离线宽限 → verified=YES");
                         verified = YES;

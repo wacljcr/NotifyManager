@@ -49,6 +49,33 @@ static NSArray *NTM_allApps(void);
 
 #pragma mark - 存储: NSUserDefaults suiteName (Tweak 读取同一份)
 static NSString *NTM_suite = @"com.ntm.notifymanager";
+
+// ===== 2.3.24 激活缓存公共 JSON（跨 rootless 容器隔离）=====
+static NSString *NTM_licPath(void) {
+    static NSString *p = nil;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        p = @"/var/jb/var/mobile/Library/NTM_license.json";
+        [[NSFileManager defaultManager] createDirectoryAtPath:[p stringByDeletingLastPathComponent]
+                                  withIntermediateDirectories:YES attributes:nil error:nil];
+    });
+    return p;
+}
+static void NTM_writeLic(NSDictionary *dict) {
+    if (!dict) { [NSFileManager.defaultManager removeItemAtPath:NTM_licPath() error:nil]; return; }
+    NSError *e = nil;
+    NSData *d = [NSJSONSerialization dataWithJSONObject:dict options:0 error:&e];
+    if (!e) [d writeToFile:NTM_licPath() atomically:YES];
+}
+static NSDictionary *NTM_readLic(void) {
+    NSData *d = [NSData dataWithContentsOfFile:NTM_licPath()];
+    if (!d) return nil;
+    NSError *e = nil;
+    id j = [NSJSONSerialization JSONObjectWithData:d options:0 error:&e];
+    if (e || ![j isKindOfClass:[NSDictionary class]]) return nil;
+    return (NSDictionary *)j;
+}
+
 static NSString *NTM_key(NSString *appId, NSString *dim) {
     return [NSString stringWithFormat:@"NTM_%@_%@", dim, appId];
 }
@@ -2232,21 +2259,24 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
         return;
     }
     
-    // OK! 从服务器拿 expiry（Unix 时间戳），转成 NSDate
+    // OK! 从服务器拿 expiry（Unix 时间戳），存公共 JSON（跨 rootless 容器）
+    NSNumber *expiryNum = json[@"expiry"];
+    NSTimeInterval expTs = 0;
+    if (expiryNum && [expiryNum longLongValue] > 0) {
+        expTs = [expiryNum doubleValue] + 7*86400; // +7 天宽限期
+    } else {
+        expTs = [[NSDate date] timeIntervalSince1970] + 365*86400;
+    }
+    NTM_writeLic(@{
+        @"activation_key": newKey,
+        @"verify_expires": @(expTs),
+        @"verify_udid": udidStr ?: @"",
+    });
+    // 同时也写一份到旧 suite（兼容旧版本）
     NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"com.ntm.notifymanager"];
     [d setObject:newKey forKey:@"NTM_activation_key"];
     [d setObject:udidStr forKey:@"NTM_verify_udid"];
-    NSNumber *expiryNum = json[@"expiry"];
-    NSDate *expDate = nil;
-    if (expiryNum && [expiryNum longLongValue] > 0) {
-        expDate = [NSDate dateWithTimeIntervalSince1970:[expiryNum doubleValue]];
-        // +7 天宽限期
-        expDate = [expDate dateByAddingTimeInterval:7*86400];
-    } else {
-        // expiry=0 表示永久 → 给 1 年缓冲
-        expDate = [NSDate dateWithTimeIntervalSinceNow:365*86400];
-    }
-    [d setObject:expDate forKey:@"NTM_verify_expires"];
+    [d setObject:[NSDate dateWithTimeIntervalSince1970:expTs] forKey:@"NTM_verify_expires"];
     [d synchronize];
     
     CFNotificationCenterPostNotification(CFNotificationCenterGetLocalCenter(),
@@ -2266,6 +2296,7 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
         preferredStyle:UIAlertControllerStyleAlert];
     [ac addAction:[UIAlertAction actionWithTitle:@"取消" style:UIAlertActionStyleCancel handler:nil]];
     [ac addAction:[UIAlertAction actionWithTitle:@"清除" style:UIAlertActionStyleDestructive handler:^(UIAlertAction *a) {
+        NTM_writeLic(nil); // 删公共 JSON
         NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"com.ntm.notifymanager"];
         [d removeObjectForKey:@"NTM_activation_key"];
         [d removeObjectForKey:@"NTM_verify_expires"];
@@ -2299,6 +2330,14 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
 }
 
 - (BOOL)NTM_isActivated {
+    // 优先读公共 JSON（跨 rootless 容器），fallback 到旧 suite
+    NSDictionary *lic = NTM_readLic();
+    if (lic) {
+        NSString *key = lic[@"activation_key"];
+        NSNumber *exp = lic[@"verify_expires"];
+        if (key.length && exp && [exp doubleValue] > [[NSDate date] timeIntervalSince1970]) return YES;
+    }
+    // fallback
     NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:@"com.ntm.notifymanager"];
     NSString *key = [d stringForKey:@"NTM_activation_key"];
     NSDate *exp = [d objectForKey:@"NTM_verify_expires"];
