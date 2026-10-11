@@ -1945,6 +1945,7 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     CGFloat w = self.view.bounds.size.width - 32;
     CGFloat h = active ? 76 : 130;  // 未激活时高一点（放 UDID 行）
     bar = [[UIView alloc] initWithFrame:CGRectMake(16, 0, w, h)];
+    bar.tag = 8888;  // 跳过 NTM_applyLock 的禁用
     bar.backgroundColor = active
         ? [UIColor colorWithRed:0.88 green:0.96 blue:0.90 alpha:1]
         : [UIColor colorWithRed:1.0 green:0.92 blue:0.82 alpha:1];
@@ -2056,46 +2057,37 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     }
 }
 
-// 递归 disable/enable 所有 UIControl
+// 递归 disable/enable UIControl，但跳过激活横幅（tag=8888 的父视图内的控件不禁用）
 - (void)NTM_applyLock {
     BOOL lock = _ntmLocked;
-    // 导航栏按钮
     self.navigationItem.rightBarButtonItem.enabled = !lock;
-    // 顶部 header 里所有控件
-    UIView *header = _tableView.tableHeaderView;
-    if (header) [self NTM_disableControlsIn:header locked:lock];
-    // 分类/过滤/搜索
+    // 顶部控件（不走 header，避免误伤激活横幅里的按钮）
     _catSeg.enabled = !lock;
     _filterSeg.enabled = !lock;
     _searchBar.userInteractionEnabled = !lock;
     _selEntryBtn.enabled = !lock;
-    // 全局自动授权开关
     _autoAuthSwitch.enabled = !lock;
-    // 表格（cell 在 cellForRow 里各自处理）
     _tableView.userInteractionEnabled = !lock;
-    // 批量操作按钮（topRow/editCol 等）
-    if (_topRow) [self NTM_disableControlsIn:_topRow locked:lock];
-    if (_editCol) [self NTM_disableControlsIn:_editCol locked:lock];
-    if (_headCol) [self NTM_disableControlsIn:_headCol locked:lock];
+    if (_topRow)  [self NTM_disableControlsIn:_topRow  locked:lock skipTag:8888];
+    if (_editCol) [self NTM_disableControlsIn:_editCol locked:lock skipTag:8888];
+    if (_headCol) [self NTM_disableControlsIn:_headCol locked:lock skipTag:8888];
 }
 
-- (void)NTM_disableControlsIn:(UIView *)view locked:(BOOL)lock {
+- (void)NTM_disableControlsIn:(UIView *)view locked:(BOOL)lock skipTag:(NSInteger)skipTag {
+    // 如果当前 view 就是 skipTag，跳过它的所有子控件
+    if (view.tag == skipTag) return;
     for (UIView *sub in view.subviews) {
+        if (sub.tag == skipTag) continue;  // 跳过 skipTag 容器
         if ([sub isKindOfClass:[UIControl class]]) {
             ((UIControl *)sub).enabled = !lock;
         }
-        [self NTM_disableControlsIn:sub locked:lock];
+        [self NTM_disableControlsIn:sub locked:lock skipTag:skipTag];
     }
 }
 
-// 给 AppCell 用的类方法
-static void NTM_disableAllIn(UIView *v, BOOL lock) {
-    for (UIView *sub in v.subviews) {
-        if ([sub isKindOfClass:[UIControl class]]) {
-            ((UIControl *)sub).enabled = !lock;
-        }
-        NTM_disableAllIn(sub, lock);
-    }
+// 旧签名兼容（不带 skipTag）
+- (void)NTM_disableControlsIn:(UIView *)view locked:(BOOL)lock {
+    [self NTM_disableControlsIn:view locked:lock skipTag:0];
 }
 
 - (void)activationTapped {
