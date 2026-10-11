@@ -638,7 +638,7 @@ __attribute__((constructor)) static void init() {
             NSString *body = [NSString stringWithFormat:
                 @"action=verify&device_id=%@&tweak_id=com.ntm.notifymanager",
                 udidStr];
-            NSMutableURLRequest *vreq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"http://101.200.189.251/pulonglu/verify.php"]];
+            NSMutableURLRequest *vreq = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"http://101.200.189.251/verify.php"]];
             vreq.HTTPMethod = @"POST";
             vreq.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
             [vreq setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
