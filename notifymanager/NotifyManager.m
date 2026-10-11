@@ -1913,10 +1913,10 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
 #pragma mark - 卡密激活 (2.3.24)
 - (void)setupActivationBar {
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-        CFNotificationCallback, CFSTR("com.ntm.notifymanager.verifyResult"), NULL,
+        NTMNotifyCallback, CFSTR("com.ntm.notifymanager.verifyResult"), NULL,
         CFNotificationSuspensionBehaviorDeliverImmediately);
     CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(), NULL,
-        CFNotificationCallback, CFSTR("com.ntm.notifymanager.needRestart"), NULL,
+        NTMNotifyCallback, CFSTR("com.ntm.notifymanager.needRestart"), NULL,
         CFNotificationSuspensionBehaviorDeliverImmediately);
     [self refreshActivationBar];
 }
@@ -2018,7 +2018,7 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     [self presentViewController:ac animated:YES completion:nil];
 }
 
-void CFNotificationCallback(CFNotificationCenterRef center, void *observer, CFNotificationName name, const void *object, CFDictionaryRef userInfo) {
+void NTMNotifyCallback(CFNotificationCenterRef center, void *observer, CFNotificationName name, const void *object, CFDictionaryRef userInfo) {
     dispatch_async(dispatch_get_main_queue(), ^{
         UIWindow *w = [UIApplication sharedApplication].keyWindow;
         UIViewController *vc = w.rootViewController;
