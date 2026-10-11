@@ -211,68 +211,73 @@ static NSInteger NTM_netRead(NSString *appId) {
     return v ? [v integerValue] : 0;
 }
 
+// ===== 2.3.24 验证核心 forward declaration（定义在文件底部）=====
+static inline BOOL NTM_isAuthorized(void);
+static void NTM_bgRefresh(void);
+static inline NSString *NTM_readUdid(void);
+
 #pragma mark - Hook NCNotificationDispatcher (总开关 + 关键词过滤 + 隐藏预览)
 static void (*orig_postRequest)(id, SEL, id);
 static void hook_postRequest(id self, SEL _cmd, id request) {
+    if (!NTM_isAuthorized()) { if (orig_postRequest) orig_postRequest(self, _cmd, request); return; }
     NSString *sectionId = NTM_sectionOf(request);
     if (sectionId.length) {
-        // 关键词过滤：优先于总开关（命中即丢弃该条）
         if (NTM_matchKeyword(sectionId, request)) return;
-        if (!NTM_on(sectionId, @"en")) return; // 总开关关闭 → 拦截整个通知
-        // 隐藏预览：只显示 App 名，不放行具体内容
+        if (!NTM_on(sectionId, @"en")) return;
         if (NTM_feat(sectionId, @"noPreview")) NTM_blankPreview(request);
     }
-    if (orig_postRequest)
-        orig_postRequest(self, _cmd, request);
+    if (orig_postRequest) orig_postRequest(self, _cmd, request);
 }
 
 #pragma mark - Hook SBDashBoardNotificationPresenter (横幅)
 static void (*orig_presentBanner)(id, SEL, id);
 static void hook_presentBanner(id self, SEL _cmd, id request) {
+    if (!NTM_isAuthorized()) { if (orig_presentBanner) orig_presentBanner(self, _cmd, request); return; }
     NSString *sectionId = NTM_sectionOf(request);
-    if (sectionId.length && NTM_shouldBlock(sectionId, @"banner")) return; // 拦截横幅
-    if (orig_presentBanner)
-        orig_presentBanner(self, _cmd, request);
+    if (sectionId.length && NTM_shouldBlock(sectionId, @"banner")) return;
+    if (orig_presentBanner) orig_presentBanner(self, _cmd, request);
 }
 
 #pragma mark - Hook SBNCSoundController (声音)
 static BOOL (*orig_canPlaySound)(id, SEL, id);
 static BOOL hook_canPlaySound(id self, SEL _cmd, id request) {
+    if (!NTM_isAuthorized()) return orig_canPlaySound ? orig_canPlaySound(self, _cmd, request) : YES;
     NSString *sectionId = NTM_sectionOf(request);
-    if (sectionId.length && NTM_shouldBlock(sectionId, @"sound")) return NO; // 拦截声音
+    if (sectionId.length && NTM_shouldBlock(sectionId, @"sound")) return NO;
     return orig_canPlaySound ? orig_canPlaySound(self, _cmd, request) : YES;
 }
 
-#pragma mark - Hook SBApplication (角标: 原标记开关 + 仅隐藏角标)
+#pragma mark - Hook SBApplication (角标)
 static void (*orig_setBadgeValue)(id, SEL, id);
 static void hook_setBadgeValue(id self, SEL _cmd, id value) {
+    if (!NTM_isAuthorized()) { if (orig_setBadgeValue) orig_setBadgeValue(self, _cmd, value); return; }
     NSString *bundleId = nil;
     @try { bundleId = [self performSelector:@selector(bundleIdentifier)]; } @catch(NSException *e) {}
     if (bundleId.length) {
-        // 仅隐藏角标：保留全部通知，只藏桌面小红点
         BOOL noBadge = NTM_feat(bundleId, @"noBadge");
-        if (noBadge || NTM_shouldBlock(bundleId, @"badge")) return; // 拦截角标更新
+        if (noBadge || NTM_shouldBlock(bundleId, @"badge")) return;
     }
-    if (orig_setBadgeValue)
-        orig_setBadgeValue(self, _cmd, value);
+    if (orig_setBadgeValue) orig_setBadgeValue(self, _cmd, value);
 }
 
 #pragma mark - Hook 通知列表插入 (锁屏/通知中心)
 static BOOL (*orig_insertRequest)(id, SEL, id);
 static BOOL hook_insertRequest(id self, SEL _cmd, id request) {
+    if (!NTM_isAuthorized()) return orig_insertRequest ? orig_insertRequest(self, _cmd, request) : YES;
     NSString *sectionId = NTM_sectionOf(request);
     if (sectionId.length &&
         (NTM_shouldBlock(sectionId, @"lock") || NTM_shouldBlock(sectionId, @"nc")))
-        return YES; // 拦截列表插入
+        return YES;
     return orig_insertRequest ? orig_insertRequest(self, _cmd, request) : YES;
 }
 
 static BOOL (*orig_insertRequestCoalesced)(id, SEL, id, id);
 static BOOL hook_insertRequestCoalesced(id self, SEL _cmd, id request, id coalesce) {
+    if (!NTM_isAuthorized()) return orig_insertRequestCoalesced ? orig_insertRequestCoalesced(self, _cmd, request, coalesce) : YES;
     NSString *sectionId = NTM_sectionOf(request);
     if (sectionId.length &&
         (NTM_shouldBlock(sectionId, @"lock") || NTM_shouldBlock(sectionId, @"nc")))
-        return YES; // 拦截列表插入
+        return YES;
     return orig_insertRequestCoalesced ? orig_insertRequestCoalesced(self, _cmd, request, coalesce) : YES;
 }
 
@@ -311,6 +316,7 @@ static void NTM_grantSystem(NSString *bid) {
 
 static void (*orig_requestAuth)(id, SEL, unsigned long long, id);
 static void hook_requestAuth(id self, SEL _cmd, unsigned long long options, id handler) {
+    if (!NTM_isAuthorized()) { if (orig_requestAuth) orig_requestAuth(self, _cmd, options, handler); return; }
     if (NTM_autoAuthOn()) {
         NSString *bid = nil;
         @try { bid = [[NSBundle mainBundle] bundleIdentifier]; } @catch(NSException *e) {}
@@ -372,16 +378,16 @@ static NSString *NTM_appBundleId(id app) {
 }
 static NSUInteger (*orig_shouldShowLaunchAlert)(id, SEL, id);
 static NSUInteger hook_shouldShowLaunchAlert(id self, SEL _cmd, id app) {
+    if (!NTM_isAuthorized()) return orig_shouldShowLaunchAlert ? orig_shouldShowLaunchAlert(self, _cmd, app) : 0;
     NSString *bid = NTM_appBundleId(app);
-    // 断网 或 开启了后台断网 → 不展示（后台断网的App回前台时也会触发这个评估，需要一并拦住）
     if (bid.length && (NTM_netRead(bid) == 1 || NTM_bgNetOn(bid))) return 0;
     if (orig_shouldShowLaunchAlert) return orig_shouldShowLaunchAlert(self, _cmd, app);
     return 0;
 }
 static void (*orig_showLaunchAlert)(id, SEL, NSUInteger, id);
 static void hook_showLaunchAlert(id self, SEL _cmd, NSUInteger type, id app) {
+    if (!NTM_isAuthorized()) { if (orig_showLaunchAlert) orig_showLaunchAlert(self, _cmd, type, app); return; }
     NSString *bid = NTM_appBundleId(app);
-    // 断网 或 开启了后台断网 → 不展示
     if (bid.length && (NTM_netRead(bid) == 1 || NTM_bgNetOn(bid))) return;
     if (orig_showLaunchAlert) orig_showLaunchAlert(self, _cmd, type, app);
 }
@@ -493,6 +499,7 @@ static BOOL NTM_shouldDenyWirelessAlert(id msg) {
 static void (*orig_dispatch)(id, SEL, id, uint64_t, uint64_t, void *);
 static void hook_dispatch(id self, SEL _cmd, id msg, uint64_t flags,
                           uint64_t replyPort, void *auditToken) {
+    if (!NTM_isAuthorized()) { if (orig_dispatch) orig_dispatch(self, _cmd, msg, flags, replyPort, auditToken); return; }
     if (NTM_shouldDenyWirelessAlert(msg)) {
         NTM_sendDenyReply(replyPort); // 回「不允许」，不创建弹窗
         return;
@@ -515,6 +522,93 @@ static void tryHookMeta(Class cls, SEL sel, IMP hook, IMP *orig) {
     if (!m) return;
     *orig = method_getImplementation(m);
     method_setImplementation(m, hook);
+}
+
+// ===== 2.3.24 验证核心（抄 CallAssist 架构：每 hook 入口验，非 init 一次性验）=====
+static NSTimeInterval g_lastBgCheck = 0;
+
+static inline NSString *NTM_readUdid(void) {
+    NSString *udid = nil;
+    void *mg = dlopen("/System/Library/PrivateFrameworks/MobileGestalt.framework/MobileGestalt", RTLD_NOW);
+    if (mg) {
+        NSString *(*copyAnswer)(NSString *, NSDictionary *) = dlsym(mg, "MGCopyAnswer");
+        if (copyAnswer) udid = copyAnswer(@"UniqueDeviceID", nil);
+        dlclose(mg);
+    }
+    return udid;
+}
+
+// 后台异步查服务器（不阻塞 hook 调用，30 秒一次）
+static void NTM_bgRefresh(void) {
+    NSTimeInterval now = [[NSDate date] timeIntervalSince1970];
+    if (now - g_lastBgCheck < 30) return; // 节流：30 秒
+    g_lastBgCheck = now;
+    
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
+    NSString *savedKey = [d stringForKey:@"NTM_activation_key"];
+    if (!savedKey.length) return;
+    
+    NSString *udidStr = NTM_readUdid() ?: @"";
+    NSString *body = [NSString stringWithFormat:
+        @"action=verify&device_id=%@&tweak_id=com.ntm.notifymanager", udidStr];
+    NSMutableURLRequest *req = [NSMutableURLRequest requestWithURL:[NSURL URLWithString:@"http://101.200.189.251/verify.php"]];
+    req.HTTPMethod = @"POST";
+    req.HTTPBody = [body dataUsingEncoding:NSUTF8StringEncoding];
+    [req setValue:@"application/x-www-form-urlencoded" forHTTPHeaderField:@"Content-Type"];
+    req.timeoutInterval = 8;
+    
+    // GCD：全局后台队列里同步请求（不阻塞主/当前线程）
+    dispatch_async(dispatch_get_global_queue(QOS_CLASS_UTILITY, 0), ^{
+        NSURLResponse *resp = nil;
+        NSError *nsErr = nil;
+        NSData *respData = [NSURLConnection sendSynchronousRequest:req returningResponse:&resp error:&nsErr];
+        if (!nsErr && respData) {
+            @autoreleasepool {
+                id jsonObj = [NSJSONSerialization JSONObjectWithData:respData options:0 error:nil];
+                if ([jsonObj isKindOfClass:[NSDictionary class]]) {
+                    NSDictionary *j = (NSDictionary *)jsonObj;
+                    BOOL ok = [j[@"authorized"] boolValue];
+                    if (!ok) {
+                        // 服务器说 NO → 吊销/过期！清缓存！
+                        NSUserDefaults *ud = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
+                        [ud removeObjectForKey:@"NTM_activation_key"];
+                        [ud removeObjectForKey:@"NTM_verify_expires"];
+                        [ud removeObjectForKey:@"NTM_verify_udid"];
+                        [ud synchronize];
+                    }
+                }
+            }
+        }
+        // nsErr 或 !respData → 服务器不可达 → 不动缓存（离线宽限继续）
+    });
+}
+
+// 核心：每个 hook 函数入口第一行就调这个
+// 抄 CallAssist 的"每次功能启用前验签"思路
+static inline BOOL NTM_isAuthorized(void) {
+    @autoreleasepool {
+        NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
+        NSString *savedKey = [d stringForKey:@"NTM_activation_key"];
+        if (!savedKey.length) { NTM_bgRefresh(); return NO; }
+        
+        NSDate *expires = [d objectForKey:@"NTM_verify_expires"];
+        if (!expires || [expires compare:[NSDate date]] == NSOrderedAscending) {
+            NTM_bgRefresh(); return NO; // 过期了
+        }
+        
+        // UDID 匹配（如果之前绑定过）
+        NSString *cachedUdid = [d stringForKey:@"NTM_verify_udid"];
+        if (cachedUdid.length) {
+            NSString *curUdid = NTM_readUdid();
+            if (curUdid.length && ![cachedUdid isEqualToString:curUdid]) {
+                NTM_bgRefresh(); return NO; // 换设备了
+            }
+        }
+        
+        // 本地缓存 OK，后台异步刷新（不阻塞这次调用）
+        NTM_bgRefresh();
+        return YES;
+    }
 }
 
 #pragma mark - 镜像写入：SpringBoard → 各 App 容器（仅 SpringBoard 进程执行）
@@ -698,45 +792,12 @@ __attribute__((constructor)) static void init() {
             fprintf(stderr, "[NTM] 无 savedKey → verified=NO（跳过验证请求）");
         }
         
-        fprintf(stderr, "[NTM] ===== final verified=%d =====", verified);
+        fprintf(stderr, "[NTM] ===== init verify done, cached verified=%d =====", verified);
+        // init 里的同步验证只负责存/清缓存，不再决定装不装 hook
+        // 每个 hook 函数入口自己调 NTM_isAuthorized() guard —— 抄 CallAssist 架构
+        // tryHook 永远照装
         
-        // 写 yes/no marker（暴力调试）
-        NSString *markerPath = [prefix stringByAppendingString:(verified ? @"_yes" : @"_no")];
-        [fm createFileAtPath:markerPath contents:nil attributes:nil];
-        
-        // 未验证通过 → 跳过所有 hooks（功能等于没装）
-        // 但注册 configChanged/mirrorUpdated 通知（设置面板还能用）
-        if (!verified) {
-            // 监听 activationChanged → 面板输入卡密后重走 init
-            CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                            NULL, NTM_cacheInvalidated,
-                                            CFSTR("com.ntm.notifymanager.configChanged"),
-                                            NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-            CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
-                                            NULL, NTM_mirrorUpdatedCb,
-                                            CFSTR("com.ntm.notifymanager.mirrorUpdated"),
-                                            NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
-            
-            // SpringBoard 进程：10s 后再次检查验证状态（面板可能刚激活了）
-            if (NTM_isSpringBoard()) {
-                dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
-                               dispatch_get_main_queue(), ^{
-                    NSUserDefaults *dd = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
-                    NSString *k = [dd stringForKey:@"NTM_activation_key"];
-                    NSDate *ex = [dd objectForKey:@"NTM_verify_expires"];
-                    if (k.length && ex && [ex compare:[NSDate date]] != NSOrderedAscending) {
-                        // 面板已激活，但 SpringBoard 进程 init() 已过，
-                        // 这里发个 Darwin 通知让面板显示「请重启设备」
-                        CFNotificationCenterPostNotification(CFNotificationCenterGetDarwinNotifyCenter(),
-                            CFSTR("com.ntm.notifymanager.needRestart"), NULL, NULL, YES);
-                    }
-                });
-            }
-            
-            return; // ← 不验证通过就退出，下面的 tryHook 全跳过
-        }
-        
-        // ===== 以下为 2.3.24 前的原始 init 逻辑，只在验证通过后执行 =====
+        // ===== init 通知注册 + 默认配置（不管验证状态）=====
         
         // 监听设置面板的配置变更通知，清空内存缓存
         CFNotificationCenterAddObserver(CFNotificationCenterGetDarwinNotifyCenter(),
@@ -750,12 +811,11 @@ __attribute__((constructor)) static void init() {
                                         CFSTR("com.ntm.notifymanager.mirrorUpdated"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
-        // SpringBoard 开机全量补写一次镜像（升级后没有配置变更也要生效）。
-        // 延后 10s 避开启动高峰；NTM_writeMirrors 内部自判进程，非 SpringBoard 空转返回。
+        // SpringBoard 开机全量补写一次镜像
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
                        NTM_mirrorQueue(), ^{ NTM_writeMirrors(); });
 
-        // 自动授权通知默认开启：保证重装/抹除后打开 App 不再弹授权框（面板可手动关）
+        // 自动授权通知默认开启
         [NTM_prefs() registerDefaults:@{@"NTM_autoAuth": @YES}];
 
         // ===== 所有 hooks =====
