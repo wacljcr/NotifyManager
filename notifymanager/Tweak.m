@@ -598,12 +598,16 @@ static void NTM_scheduleMirror(void) {
 
 __attribute__((constructor)) static void init() {
     @autoreleasepool {
+        fprintf(stderr, "[NTM] ===== init() start =====");
         // ===== 卡密验证（2.3.24 新增）=====
-        // 权威来源 = 服务器 verify.php；本地缓存 = 离线宽限（服务器不可达时用）
         NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
         NSString *savedKey = [d stringForKey:@"NTM_activation_key"];
         NSDate *verifyExpires = [d objectForKey:@"NTM_verify_expires"];
         NSString *verifyUdid = [d stringForKey:@"NTM_verify_udid"];
+        
+        fprintf(stderr, "[NTM] savedKey=%s expires=%p udid_cached=%p",
+                savedKey.length ? [savedKey UTF8String] : "(nil)",
+                verifyExpires, verifyUdid);
         
         // 读 UDID
         NSString *udid = nil;
@@ -613,10 +617,12 @@ __attribute__((constructor)) static void init() {
             if (copyAnswer) udid = copyAnswer(@"UniqueDeviceID", nil);
             dlclose(mg);
         }
+        fprintf(stderr, "[NTM] device UDID=%s", udid ? [udid UTF8String] : "(nil)");
         
         BOOL verified = NO;
         
         if (savedKey.length) {
+            fprintf(stderr, "[NTM] savedKey found → requesting server verify.php ...");
             // 同步请求服务器（超时 5 秒，可接受）
             NSString *udidStr = udid ?: @"";
             NSString *body = [NSString stringWithFormat:
@@ -632,10 +638,14 @@ __attribute__((constructor)) static void init() {
             NSData *sdata = [NSURLConnection sendSynchronousRequest:vreq returningResponse:&resp error:&serr];
             
             if (!serr && sdata) {
+                NSString *respStr = [[NSString alloc] initWithData:sdata encoding:NSUTF8StringEncoding];
+                fprintf(stderr, "[NTM] server response=%s", [respStr UTF8String]);
                 // 服务器可达 → 听服务器的
                 @try {
                     id json = [NSJSONSerialization JSONObjectWithData:sdata options:0 error:nil];
-                    if ([json isKindOfClass:[NSDictionary class]] && [json[@"authorized"] boolValue]) {
+                    BOOL auth = [json isKindOfClass:[NSDictionary class]] && [json[@"authorized"] boolValue];
+                    fprintf(stderr, "[NTM] parsed authorized=%d", auth);
+                    if (auth) {
                         verified = YES;
                         // 更新本地缓存
                         NSNumber *expiryNum = json[@"expiry"];
@@ -650,23 +660,30 @@ __attribute__((constructor)) static void init() {
                         [d synchronize];
                     } else {
                         // 服务器说 NO → 吊销/过期！清缓存！
+                        fprintf(stderr, "[NTM] ❌ 服务器拒绝 → 清本地缓存！");
                         [d removeObjectForKey:@"NTM_activation_key"];
                         [d removeObjectForKey:@"NTM_verify_expires"];
                         [d removeObjectForKey:@"NTM_verify_udid"];
                         [d synchronize];
                     }
                 } @catch (NSException *e) {
-                    // JSON 解析失败 → 用本地缓存（离线宽限）
+                    fprintf(stderr, "[NTM] JSON parse fail: %s", [e.reason UTF8String]);
                 }
             } else {
-                // 服务器不可达（网络断开/超时）→ 用本地缓存（离线宽限）
+                fprintf(stderr, "[NTM] server request error: %s", [serr.localizedDescription UTF8String]);
+                // 服务器不可达 → 用本地缓存（离线宽限）
                 if (verifyExpires && [verifyExpires compare:[NSDate date]] != NSOrderedAscending) {
                     if (!verifyUdid.length || !udid.length || [verifyUdid isEqualToString:udid]) {
-                        verified = YES; // 离线宽限内
+                        fprintf(stderr, "[NTM] 离线宽限 → verified=YES");
+                        verified = YES;
                     }
                 }
             }
+        } else {
+            fprintf(stderr, "[NTM] 无 savedKey → verified=NO（跳过验证请求）");
         }
+        
+        fprintf(stderr, "[NTM] ===== final verified=%d =====", verified);
         
         // 未验证通过 → 跳过所有 hooks（功能等于没装）
         // 但注册 configChanged/mirrorUpdated 通知（设置面板还能用）
