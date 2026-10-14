@@ -371,19 +371,54 @@ static NSString *NTM_appBundleId(id app) {
     return bid.length ? bid : nil;
 }
 static NSUInteger (*orig_shouldShowLaunchAlert)(id, SEL, id);
+// 2.3.24 扩展：新安装 App 自动放行 WiFi+蜂窝（不弹系统选择框）
+//  面板已配置的 App → 按配置走（断网=拦, 其他=让系统处理）
+//  面板未配置的 App → 默认允许 WiFi+蜂窝（不弹窗, 回系统原始报文）
+static BOOL NTM_isAppConfigured(NSString *bid) {
+    if (!bid.length) return NO;
+    NSUserDefaults *d = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
+    [d synchronize];
+    NSDictionary *cfg = [d persistentDomainForName:NTM_suiteName];
+    if (![cfg isKindOfClass:[NSDictionary class]]) return NO;
+    NSString *suffix = [@"_" stringByAppendingString:bid];
+    for (NSString *k in cfg) {
+        if ([k hasPrefix:@"NTM_"] && [k hasSuffix:suffix]) return YES;
+    }
+    return NO;
+}
 static NSUInteger hook_shouldShowLaunchAlert(id self, SEL _cmd, id app) {
     NSString *bid = NTM_appBundleId(app);
-    // 断网 或 开启了后台断网 → 不展示（后台断网的App回前台时也会触发这个评估，需要一并拦住）
-    if (bid.length && (NTM_netRead(bid) == 1 || NTM_bgNetOn(bid))) return 0;
-    if (orig_shouldShowLaunchAlert) return orig_shouldShowLaunchAlert(self, _cmd, app);
+    if (!bid.length) {
+        if (orig_shouldShowLaunchAlert) return orig_shouldShowLaunchAlert(self, _cmd, app);
+        return 0;
+    }
+    NSInteger net = NTM_netRead(bid);
+    BOOL bgNet = NTM_bgNetOn(bid);
+    // 断网 / 后台断网 → 不展示（和原来一致）
+    if (net == 1 || bgNet) return 0;
+    // 面板已配置且非断网 → 让系统走原始逻辑（蜂窝策略已由面板写入系统）
+    if (NTM_isAppConfigured(bid)) {
+        if (orig_shouldShowLaunchAlert) return orig_shouldShowLaunchAlert(self, _cmd, app);
+        return 0;
+    }
+    // 面板未配置（新安装 App）→ 默认允许 WiFi+蜂窝，不弹窗
     return 0;
 }
 static void (*orig_showLaunchAlert)(id, SEL, NSUInteger, id);
 static void hook_showLaunchAlert(id self, SEL _cmd, NSUInteger type, id app) {
     NSString *bid = NTM_appBundleId(app);
-    // 断网 或 开启了后台断网 → 不展示
-    if (bid.length && (NTM_netRead(bid) == 1 || NTM_bgNetOn(bid))) return;
-    if (orig_showLaunchAlert) orig_showLaunchAlert(self, _cmd, type, app);
+    if (!bid.length) {
+        if (orig_showLaunchAlert) orig_showLaunchAlert(self, _cmd, type, app);
+        return;
+    }
+    NSInteger net = NTM_netRead(bid);
+    BOOL bgNet = NTM_bgNetOn(bid);
+    if (net == 1 || bgNet) return;
+    if (NTM_isAppConfigured(bid)) {
+        if (orig_showLaunchAlert) orig_showLaunchAlert(self, _cmd, type, app);
+        return;
+    }
+    // 面板未配置（新安装 App）→ 不弹窗
 }
 
 #pragma mark - 直接拦截 CommCenter 的「允许"XX"使用无线数据」请求（不弹窗）
@@ -399,22 +434,26 @@ static void hook_showLaunchAlert(id self, SEL _cmd, NSUInteger type, id app) {
 // 报文格式为实测值（frida 抓 mach_msg 得到）：
 //   28 字节 = 24 字节头 + 4 字节体；msgh_bits=0x12(COPY_SEND)、msgh_id=0；
 //   体为 uint32 响应码，0 = Default = 「不允许」。
-static void NTM_sendDenyReply(uint64_t replyPort) {
+// 断网/后台断网 → 回"不允许"报文; 新安装未配置 App → 回"允许"报文（自动授权）
+// 报文格式：28 字节 = 24 字节头 + 4 字节体；response 0=不允许 1=允许
+static void NTM_sendReply(uint64_t replyPort, uint32_t response) {
     if (!replyPort) return;
     struct {
         mach_msg_header_t header;
         uint32_t response;
     } msg = {0};
     msg.header.msgh_bits = MACH_MSGH_BITS(MACH_MSG_TYPE_COPY_SEND, MACH_MSGH_BITS_ZERO);
-    msg.header.msgh_size = (mach_msg_size_t)sizeof(msg); // 28
+    msg.header.msgh_size = (mach_msg_size_t)sizeof(msg);
     msg.header.msgh_remote_port = (mach_port_t)replyPort;
     msg.header.msgh_id = 0;
-    msg.response = 0; // 0 = Default = 「不允许」
+    msg.response = response; // 0=Default(不允许)  1=Allowed(允许)
     @try {
         mach_msg(&msg.header, MACH_SEND_MSG, (mach_msg_size_t)sizeof(msg),
                  0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
     } @catch (NSException *e) {}
 }
+static void NTM_sendDenyReply(uint64_t replyPort) { NTM_sendReply(replyPort, 0); }
+static void NTM_sendAllowReply(uint64_t replyPort) { NTM_sendReply(replyPort, 1); }
 
 // 「允许“微信”使用无线数据？」→ 微信
 static NSString *NTM_appNameOfHeader(NSString *header) {
@@ -475,28 +514,30 @@ static NSString *NTM_bundleIdOfName(NSString *name) {
 }
 
 // 这条 CommCenter 请求是不是「面板里已断网的 App」
-static BOOL NTM_shouldDenyWirelessAlert(id msg) {
+// 返回值：-1=不处理(走原始逻辑), 0=回 deny(不允许), 1=回 allow(允许)
+static int NTM_checkWirelessAlert(id msg) {
     @try {
-        if (!msg) return NO;
+        if (!msg) return -1;
         NSString *src = [msg objectForKey:@"AlertSource"];
-        if (![src isKindOfClass:[NSString class]] || ![src isEqualToString:@"CommCenter"]) return NO;
+        if (![src isKindOfClass:[NSString class]] || ![src isEqualToString:@"CommCenter"]) return -1;
         NSString *hdr = [msg objectForKey:@"AlertHeader"];
-        if (![hdr isKindOfClass:[NSString class]] || ![hdr containsString:@"使用无线数据"]) return NO;
+        if (![hdr isKindOfClass:[NSString class]] || ![hdr containsString:@"使用无线数据"]) return -1;
         NSString *bid = NTM_bundleIdOfName(NTM_appNameOfHeader(hdr));
-        if (!bid.length) return NO;
-        // 与前面启动弹窗 hook 同一条件：断网 或 开了后台断网
-        return (NTM_netRead(bid) == 1 || NTM_bgNetOn(bid));
-    } @catch (NSException *e) { return NO; }
+        if (!bid.length) return -1;
+        NSInteger net = NTM_netRead(bid);
+        BOOL bgNet = NTM_bgNetOn(bid);
+        if (net == 1 || bgNet) return 0;      // 断网/后台断网 → deny
+        if (!NTM_isAppConfigured(bid)) return 1; // 新安装未配置 → allow
+        return -1;                              // 面板已配置 → 原始逻辑
+    } @catch (NSException *e) { return -1; }
 }
 
-// auditToken 是结构体（>16 字节）时按指针传，这里统一用 void* 承接并原样透传
 static void (*orig_dispatch)(id, SEL, id, uint64_t, uint64_t, void *);
 static void hook_dispatch(id self, SEL _cmd, id msg, uint64_t flags,
                           uint64_t replyPort, void *auditToken) {
-    if (NTM_shouldDenyWirelessAlert(msg)) {
-        NTM_sendDenyReply(replyPort); // 回「不允许」，不创建弹窗
-        return;
-    }
+    int r = NTM_checkWirelessAlert(msg);
+    if (r == 0) { NTM_sendDenyReply(replyPort); return; }
+    if (r == 1) { NTM_sendAllowReply(replyPort); return; }
     if (orig_dispatch) orig_dispatch(self, _cmd, msg, flags, replyPort, auditToken);
 }
 
@@ -582,6 +623,81 @@ static void NTM_writeMirrors(void) {
     }
 }
 
+// ===== 2.3.24 新增：SpringBoard 启动时重新应用系统蜂窝策略 =====
+// 根因：iOS 注销/重启后会重置蜂窝策略为"允许 WiFi+蜂窝"，
+// 但面板只在用户打开改设置时才调 NTM_syncCellular 写 PSAppDataUsagePolicyCache，
+// SpringBoard init 完全没重新应用 → 注销后网络/通知设置全部还原。
+// 修复：和 NTM_writeMirrors 同步，init 后 10s 遍历面板配置里所有 NTM_net_<bid>，
+// 重新调 PSAppDataUsagePolicyCache 把系统策略写回去。
+
+static void NTM_loadPolicyFramework(void) {
+    static BOOL loaded = NO;
+    if (loaded) return;
+    if (NSClassFromString(@"PSAppDataUsagePolicyCache")) { loaded = YES; return; }
+    dlopen("/System/Library/PrivateFrameworks/SettingsCellular.framework/SettingsCellular", RTLD_NOW);
+    if (NSClassFromString(@"PSAppDataUsagePolicyCache")) { loaded = YES; return; }
+    dlopen("/System/Library/PrivateFrameworks/Preferences.framework/Preferences", RTLD_NOW);
+    if (NSClassFromString(@"PSAppDataUsagePolicyCache")) loaded = YES;
+}
+
+// 按面板配置写 PSAppDataUsagePolicyCache（和 NotifyManager.m 完全一致的调用路径）
+static void NTM_syncCellularSB(NSString *appId, NSInteger policy) {
+    if (!appId.length) return;
+    // policy: 0=wifi+流量 1=断网 2=只wifi 3=只流量；系统侧 1=允许 0=禁止
+    long long cell = (policy == 0 || policy == 3) ? 1 : 0;
+    long long wifi = (policy == 0 || policy == 2) ? 1 : 0;
+    NTM_loadPolicyFramework();
+    @try {
+        Class cls = NSClassFromString(@"PSAppDataUsagePolicyCache");
+        if (!cls) return;
+        id cache = ((id (*)(id, SEL))objc_msgSend)(cls, NSSelectorFromString(@"sharedInstance"));
+        if (!cache) return;
+        id pol = nil;
+        SEL selPoliciesFor = NSSelectorFromString(@"policiesFor:");
+        if ([cache respondsToSelector:selPoliciesFor])
+            pol = ((id (*)(id, SEL, id))objc_msgSend)(cache, selPoliciesFor, appId);
+        if (pol) {
+            SEL sCell = NSSelectorFromString(@"setCellular:");
+            SEL sWifi = NSSelectorFromString(@"setWifi:");
+            if ([pol respondsToSelector:sCell])
+                ((void (*)(id, SEL, long long))objc_msgSend)(pol, sCell, cell);
+            if ([pol respondsToSelector:sWifi])
+                ((void (*)(id, SEL, long long))objc_msgSend)(pol, sWifi, wifi);
+        } else {
+            Class polCls = NSClassFromString(@"CTDataUsagePolicies");
+            SEL initSel = NSSelectorFromString(@"init:withCellularPolicy:andWifiPolicy:");
+            if (polCls && [polCls instancesRespondToSelector:initSel]) {
+                id obj = ((id (*)(id, SEL))objc_msgSend)((id)polCls, NSSelectorFromString(@"alloc"));
+                pol = ((id (*)(id, SEL, id, long long, long long))objc_msgSend)(obj, initSel, appId, cell, wifi);
+            }
+        }
+        if (!pol) return;
+        SEL setPol = NSSelectorFromString(@"setPolicies:completion:");
+        if ([cache respondsToSelector:setPol]) {
+            void (^done)(void) = ^{};
+            ((void (*)(id, SEL, id, id))objc_msgSend)(cache, setPol, pol, done);
+        }
+    } @catch(NSException *e) {}
+}
+
+// SpringBoard 启动时全量重新应用系统蜂窝策略（和 NTM_writeMirrors 同步）
+static void NTM_applyAllPolicies(void) {
+    if (!NTM_isSpringBoard()) return;
+    @autoreleasepool {
+        NSUserDefaults *fresh = [[NSUserDefaults alloc] initWithSuiteName:NTM_suiteName];
+        [fresh synchronize];
+        NSDictionary *cfg = [[fresh persistentDomainForName:NTM_suiteName] isKindOfClass:[NSDictionary class]] ?
+                           [fresh persistentDomainForName:NTM_suiteName] : @{};
+        for (NSString *k in cfg) {
+            if (![k hasPrefix:@"NTM_net_"]) continue;
+            NSString *bid = [k substringFromIndex:@"NTM_net_".length];
+            if (!bid.length) continue;
+            NSInteger policy = [cfg[k] integerValue];
+            NTM_syncCellularSB(bid, policy);
+        }
+    }
+}
+
 // 防抖：面板批量开关会连发 configChanged，攒 0.3s 写一次（串行队列，避免并发写）
 static void NTM_scheduleMirror(void) {
     if (!NTM_isSpringBoard()) return;
@@ -610,10 +726,10 @@ __attribute__((constructor)) static void init() {
                                         CFSTR("com.ntm.notifymanager.mirrorUpdated"),
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
-        // SpringBoard 开机全量补写一次镜像（升级后没有配置变更也要生效）。
-        // 延后 10s 避开启动高峰；NTM_writeMirrors 内部自判进程，非 SpringBoard 空转返回。
+        // SpringBoard 开机全量补写一次镜像 + 重新应用系统蜂窝策略（注销后系统会重置蜂窝策略！）
+        // 延后 10s 避开启动高峰；NTM_writeMirrors / NTM_applyAllPolicies 内部自判进程，非 SpringBoard 空转返回。
         dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
-                       NTM_mirrorQueue(), ^{ NTM_writeMirrors(); });
+                       NTM_mirrorQueue(), ^{ NTM_writeMirrors(); NTM_applyAllPolicies(); });
 
         // 自动授权通知默认开启：保证重装/抹除后打开 App 不再弹授权框（面板可手动关）
         [NTM_prefs() registerDefaults:@{@"NTM_autoAuth": @YES}];
