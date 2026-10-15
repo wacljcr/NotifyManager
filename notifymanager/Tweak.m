@@ -609,6 +609,9 @@ static int NTM_checkWirelessAlert(id msg) {
 
 // NTM_syncCellularSB 定义在文件后部，此处前向声明
 static void NTM_syncCellularSB(NSString *bid, NSInteger policy);
+// 以下两个在文件后部定义，hook_dispatch 在前面要用，先前向声明
+static NSString *NTM_extractNetAuthAppName(NSString *full);
+static NSString *NTM_frontmostBundleId(void);
 
 static void (*orig_dispatch)(id, SEL, id, uint64_t, uint64_t, void *);
 static void hook_dispatch(id self, SEL _cmd, id msg, uint64_t flags,
