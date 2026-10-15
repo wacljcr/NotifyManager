@@ -17,8 +17,13 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <mach/mach.h>
-#import <libproc.h>
-#include <audit/audit.h>
+#include <sys/proc_info.h>
+// libproc.h 是 macOS 专用头文件，iOS SDK 未提供；
+// proc_pidpath 在 iOS 上作为私有 API 可用，手动声明避免依赖头文件。
+#ifndef PROC_PIDPATHINFO_MAXSIZE
+#define PROC_PIDPATHINFO_MAXSIZE 4096
+#endif
+extern int proc_pidpath(pid_t pid, char *buf, uint32_t size);
 
 // NetGuard.m（同一 dylib）：后台断网的进程内拦截开关 + 面板「断网」状态刷新
 extern void NG_setBgBlocked(BOOL on);
