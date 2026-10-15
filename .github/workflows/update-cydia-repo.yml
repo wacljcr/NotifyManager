@@ -2,7 +2,9 @@ name: Update Cydia Repo
 
 on:
   workflow_run:
-    workflows: ["Build CarCheckPlugin"]
+    workflows:
+      - "build-notify"
+      - "build-tipa"
     types:
       - completed
 
@@ -14,10 +16,11 @@ jobs:
       - name: Checkout Cydia repo
         uses: actions/checkout@v4
         with:
-          repository: yzdmm2024/repo
+          repository: wacljcr/mumu
           token: ${{ secrets.GH_TOKEN }}
 
-      - name: Download deb artifact
+      - name: Download CarCheckPlugin deb artifact
+        if: ${{ github.event.workflow_run.name == 'build-tipa' }}
         uses: actions/download-artifact@v4
         with:
           name: CarCheckPlugin
@@ -25,14 +28,24 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GH_TOKEN }}
 
+      - name: Download NotifyManager deb artifact
+        if: ${{ github.event.workflow_run.name == 'build-notify' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: NotifyManager-deb
+          path: ./debs/
+          run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GH_TOKEN }}
+
       - name: Regenerate Packages
         run: |
+          mkdir -p debian/dists/stable/main/binary-all
           cd debs
           for deb in *.deb; do
             [ -f "$deb" ] || continue
             dpkg-deb -f "$deb" > /tmp/control
             cat /tmp/control
-            echo "Filename: ./debs/$deb"
+            echo "Filename: ./debian/pool/main/$(basename $deb)"
             echo "Size: $(stat -c%s "$deb")"
             echo "MD5sum: $(md5sum "$deb" | cut -d' ' -f1)"
             echo "SHA1: $(sha1sum "$deb" | cut -d' ' -f1)"
@@ -43,18 +56,24 @@ jobs:
           bzip2 -zkf Packages
           echo "Packages regenerated"
 
+      - name: Copy debs to pool
+        run: |
+          mkdir -p debian/pool/main
+          cp debs/*.deb debian/pool/main/ 2>/dev/null || true
+          echo "Debs copied"
+
       - name: Update Release
         run: |
           cat > Release << 'EOF'
-          Origin: NTM 越狱源
+          Origin: NTM Jailbreak Repo
           Label: NTM Repo
           Suite: stable
           Version: 1.0
           Codename: ios
           Architectures: iphoneos-arm64
           Components: main
-          Description: 通知管理 + CarCheckPlugin 越狱源
-          Support: https://github.com/yzdmm2024/repo
+          Description: NTM Jailbreak Repo
+          Support: https://github.com/wacljcr/mumu
           EOF
           echo "Date: $(date -R)" >> Release
           echo "MD5Sum:" >> Release
