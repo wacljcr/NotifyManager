@@ -17,6 +17,8 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <mach/mach.h>
+#import <libproc.h>
+#include <audit/audit.h>
 
 // NetGuard.m（同一 dylib）：后台断网的进程内拦截开关 + 面板「断网」状态刷新
 extern void NG_setBgBlocked(BOOL on);
@@ -458,7 +460,7 @@ static void NTM_sendAllowReply(uint64_t replyPort) { NTM_sendReply(replyPort, 1)
 // 「允许“微信”使用无线数据？」→ 微信
 static NSString *NTM_appNameOfHeader(NSString *header) {
     if (!header.length) return nil;
-    NSArray *quotes = @[@[@"\u201C", @"\u201D"], @[@"\"", @"\""]];
+    NSArray *quotes = @[@[@"\u201C", @"\u201D"], @[@"\u300C", @"\u300D"], @[@"\u300E", @"\u300F"], @[@"\"", @"\""]];
     for (NSArray *q in quotes) {
         NSRange l = [header rangeOfString:q[0]];
         if (l.location == NSNotFound) continue;
@@ -513,6 +515,34 @@ static NSString *NTM_bundleIdOfName(NSString *name) {
     return nil;
 }
 
+// 2.3.25 新增：从 audit_token 直接提取 bundle id（最可靠，不依赖名字解析）
+// auditToken 是触发弹窗的进程 audit token，包含 PID；通过 proc_pidpath 获取可执行文件路径，
+// 再定位 .app 目录，用 NSBundle 取出 bundle id。若 PID 指向 CommCenter/SpringBoard 等系统进程
+// 则返回 nil，让调用方回退到名字解析。
+static NSString *NTM_bundleIdFromAuditToken(void *auditToken) {
+    if (!auditToken) return nil;
+    @try {
+        audit_token_t *tok = (audit_token_t *)auditToken;
+        pid_t pid = tok->at_pid;
+        if (pid <= 0) return nil;
+        char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
+        if (proc_pidpath(pid, path, sizeof(path)) <= 0) return nil;
+        NSString *exePath = [NSString stringWithUTF8String:path];
+        if (!exePath.length) return nil;
+        // 跳过系统进程：CommCenter/SpringBoard 不是目标 App
+        if ([exePath containsString:@"CommCenter"] ||
+            [exePath containsString:@"SpringBoard"] ||
+            [exePath hasPrefix:@"/usr/libexec/"] ||
+            [exePath hasPrefix:@"/usr/sbin/"]) return nil;
+        NSURL *exeURL = [NSURL fileURLWithPath:exePath];
+        NSURL *appURL = [exeURL URLByDeletingLastPathComponent];
+        if (![appURL.path hasSuffix:@".app"]) return nil;
+        NSBundle *b = [NSBundle bundleWithURL:appURL];
+        NSString *bid = b.bundleIdentifier;
+        return bid.length ? bid : nil;
+    } @catch (NSException *e) { return nil; }
+}
+
 // 这条 CommCenter 请求是不是「面板里已断网的 App」
 // 返回值：-1=不处理(走原始逻辑), 0=回 deny(不允许), 1=回 allow(允许)
 static int NTM_checkWirelessAlert(id msg) {
@@ -535,10 +565,82 @@ static int NTM_checkWirelessAlert(id msg) {
 static void (*orig_dispatch)(id, SEL, id, uint64_t, uint64_t, void *);
 static void hook_dispatch(id self, SEL _cmd, id msg, uint64_t flags,
                           uint64_t replyPort, void *auditToken) {
-    int r = NTM_checkWirelessAlert(msg);
-    if (r == 0) { NTM_sendDenyReply(replyPort); return; }
-    if (r == 1) { NTM_sendAllowReply(replyPort); return; }
+    // 先确认是不是 CommCenter 的无线数据弹窗
+    @try {
+        NSString *src = [msg objectForKey:@"AlertSource"];
+        if (![src isEqualToString:@"CommCenter"]) {
+            if (orig_dispatch) orig_dispatch(self, _cmd, msg, flags, replyPort, auditToken);
+            return;
+        }
+        NSString *hdr = [msg objectForKey:@"AlertHeader"] ?: @"";
+        NSString *body = [msg objectForKey:@"AlertBody"] ?: [msg objectForKey:@"AlertText"] ?: @"";
+        NSString *fullText = [NSString stringWithFormat:@"%@ %@", hdr, body];
+        // 匹配各种中文变体：无线数据 / 蜂窝数据 / 数据访问
+        BOOL isNetAlert = [fullText containsString:@"无线数据"] ||
+                          [fullText containsString:@"蜂窝数据"] ||
+                          [fullText containsString:@"使用数据"] ||
+                          [fullText containsString:@"访问数据"];
+        if (!isNetAlert) {
+            if (orig_dispatch) orig_dispatch(self, _cmd, msg, flags, replyPort, auditToken);
+            return;
+        }
+        // 优先用 auditToken 提取 bundle id（最可靠）
+        NSString *bid = NTM_bundleIdFromAuditToken(auditToken);
+        // 回退：从弹窗文本解析 App 名 → bundle id
+        if (!bid.length) {
+            NSString *appName = NTM_appNameOfHeader(fullText);
+            if (appName.length) bid = NTM_bundleIdOfName(appName);
+        }
+        if (!bid.length) {
+            if (orig_dispatch) orig_dispatch(self, _cmd, msg, flags, replyPort, auditToken);
+            return;
+        }
+        NSInteger net = NTM_netRead(bid);
+        BOOL bgNet = NTM_bgNetOn(bid);
+        if (net == 1 || bgNet) { NTM_sendDenyReply(replyPort); return; }
+        if (!NTM_isAppConfigured(bid)) {
+            NTM_syncCellularSB(bid, 0); // 新安装 App 写入 allow 策略
+            NTM_sendAllowReply(replyPort);
+            return;
+        }
+    } @catch (NSException *e) {}
     if (orig_dispatch) orig_dispatch(self, _cmd, msg, flags, replyPort, auditToken);
+}
+
+// ===== 2.3.25 新增：SBSheetAlertController 展示层兜底 hook =====
+// 如果 dispatchUserNotification 方法不存在（重命名/移除），弹窗仍会经
+// SBSheetAlertController 的 showWithCompletion: 展示。此 hook 在展示层
+// 拦截网络弹窗，用名字解析识别 App 后按策略处理。
+static void (*orig_showAlertCompletion)(id, SEL, id);
+static void hook_showAlertCompletion(id self, SEL _cmd, id completion) {
+    NSString *text = nil, *info = nil;
+    @try { text = [self valueForKey:@"text"]; } @catch(NSException *e) {}
+    @try { info = [self valueForKey:@"informativeText"]; } @catch(NSException *e) {}
+    NSString *full = [NSString stringWithFormat:@"%@ %@", text ?: @"", info ?: @""];
+    BOOL isNetPopup = [full containsString:@"无线数据"] ||
+                      [full containsString:@"蜂窝数据"] ||
+                      [full containsString:@"使用数据"] ||
+                      [full containsString:@"访问数据"];
+    if (!isNetPopup) {
+        if (orig_showAlertCompletion) orig_showAlertCompletion(self, _cmd, completion);
+        return;
+    }
+    // 尝试解析 App 名
+    NSString *appName = NTM_appNameOfHeader(full);
+    NSString *bid = nil;
+    if (appName.length) bid = NTM_bundleIdOfName(appName);
+    if (!bid.length) {
+        if (orig_showAlertCompletion) orig_showAlertCompletion(self, _cmd, completion);
+        return;
+    }
+    NSInteger net = NTM_netRead(bid);
+    BOOL bgNet = NTM_bgNetOn(bid);
+    if (net == 1 || bgNet) return; // 断网 → 不展示
+    if (!NTM_isAppConfigured(bid)) {
+        NTM_syncCellularSB(bid, 0); // 新 App 写入 allow 策略
+        return;
+    }
+    if (orig_showAlertCompletion) orig_showAlertCompletion(self, _cmd, completion);
 }
 
 static void tryHook(Class cls, SEL sel, IMP hook, IMP *orig) {
@@ -680,6 +782,42 @@ static void NTM_syncCellularSB(NSString *appId, NSInteger policy) {
     } @catch(NSException *e) {}
 }
 
+// ===== 2.3.25 新增：新安装 App 自动写入 allow 策略 =====
+// 根因：新 App 首次联网时 CommCenter 查系统策略缓存发现无条目 → 触发弹窗。
+// 弹窗被 hook 拦截后虽回 "allow"，但策略缓存仍为空，下次联网再次弹窗。
+// 修复：SpringBoard 启动时遍历已安装 App，对面板未配置的（无 NTM_net_<bid>）写入
+// 系统策略缓存 allow（WiFi+蜂窝），后续联网不再弹窗、不再无网。
+// 跳过 com.apple.* 系统 App（它们有自己的策略，不该被覆盖）。
+static void NTM_writeAllowPoliciesForUnconfiguredApps(NSDictionary *cfg) {
+    NSMutableSet *configured = [NSMutableSet set];
+    for (NSString *k in cfg) {
+        if ([k hasPrefix:@"NTM_net_"]) {
+            [configured addObject:[k substringFromIndex:@"NTM_net_".length]];
+        }
+    }
+    Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
+    SEL selWS = NSSelectorFromString(@"defaultWorkspace");
+    if (!wsCls || ![wsCls respondsToSelector:selWS]) return;
+    id ws = ((id (*)(id, SEL))objc_msgSend)(wsCls, selWS);
+    SEL selAll = NSSelectorFromString(@"allInstalledApplications");
+    if (!ws || ![ws respondsToSelector:selAll]) return;
+    id arr = ((id (*)(id, SEL))objc_msgSend)(ws, selAll);
+    if (!arr) return;
+    NSUInteger processed = 0;
+    for (id proxy in arr) {
+        @try {
+            NSString *bid = nil;
+            SEL sBid = NSSelectorFromString(@"applicationIdentifier");
+            if ([proxy respondsToSelector:sBid])
+                bid = ((id (*)(id, SEL))objc_msgSend)(proxy, sBid);
+            if (!bid.length || [bid hasPrefix:@"com.apple."]) continue;
+            if ([configured containsObject:bid]) continue;
+            NTM_syncCellularSB(bid, 0); // policy=0 → allow WiFi+cellular
+            processed++;
+        } @catch(NSException *e) {}
+    }
+}
+
 // SpringBoard 启动时全量重新应用系统蜂窝策略（和 NTM_writeMirrors 同步）
 static void NTM_applyAllPolicies(void) {
     if (!NTM_isSpringBoard()) return;
@@ -695,6 +833,8 @@ static void NTM_applyAllPolicies(void) {
             NSInteger policy = [cfg[k] integerValue];
             NTM_syncCellularSB(bid, policy);
         }
+        // 2.3.25: 为面板未配置的新安装 App 写入 allow 策略
+        NTM_writeAllowPoliciesForUnconfiguredApps(cfg);
     }
 }
 
@@ -727,8 +867,8 @@ __attribute__((constructor)) static void init() {
                                         NULL, CFNotificationSuspensionBehaviorDeliverImmediately);
 
         // SpringBoard 开机全量补写一次镜像 + 重新应用系统蜂窝策略（注销后系统会重置蜂窝策略！）
-        // 延后 10s 避开启动高峰；NTM_writeMirrors / NTM_applyAllPolicies 内部自判进程，非 SpringBoard 空转返回。
-        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(10 * NSEC_PER_SEC)),
+        // 2.3.25: 延迟从 10s 减到 2s，缩小注销后策略空窗期，App 启动前完成策略写入
+        dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2 * NSEC_PER_SEC)),
                        NTM_mirrorQueue(), ^{ NTM_writeMirrors(); NTM_applyAllPolicies(); });
 
         // 自动授权通知默认开启：保证重装/抹除后打开 App 不再弹授权框（面板可手动关）
@@ -792,5 +932,10 @@ __attribute__((constructor)) static void init() {
         tryHookMeta(objc_getClass("SBUserNotificationCenter"),
                     sel_registerName("dispatchUserNotification:flags:replyPort:auditToken:"),
                     (IMP)hook_dispatch, (IMP *)&orig_dispatch);
+
+        // 2.3.25: 展示层兜底 —— 若 dispatchUserNotification 方法不存在，弹窗仍会经此展示
+        tryHook(objc_getClass("SBSheetAlertController"),
+                sel_registerName("showWithCompletion:"),
+                (IMP)hook_showAlertCompletion, (IMP *)&orig_showAlertCompletion);
     }
 }
