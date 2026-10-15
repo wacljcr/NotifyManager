@@ -501,8 +501,18 @@ static NSString *NTM_appNameOfHeader(NSString *header) {
 
 // App 中文名 → bundle id：遍历已安装 App，优先精确匹配本地化名，
 // 匹配不到再退回「本地化名是该名字的子串」中最长的那个。
+// 规范化：去空白 + Unicode 预组合，规避不同来源中文名 NFC/NFKC 归一差异
+static NSString *NTM_normName(NSString *s) {
+    if (!s.length) return nil;
+    NSString *t = [s stringByTrimmingCharactersInSet:[NSCharacterSet whitespaceAndNewlineCharacterSet]];
+    t = [t precomposedStringWithCanonicalMapping];
+    return t.length ? t : nil;
+}
+
 static NSString *NTM_bundleIdOfName(NSString *name) {
     if (!name.length) return nil;
+    NSString *target = NTM_normName(name);
+    if (!target) return nil;
     @try {
         Class wsCls = NSClassFromString(@"LSApplicationWorkspace");
         SEL selWS = NSSelectorFromString(@"defaultWorkspace");
@@ -517,19 +527,28 @@ static NSString *NTM_bundleIdOfName(NSString *name) {
         NSUInteger partialLen = 0;
         for (NSUInteger i = 0; i < n; i++) {
             id proxy = [arr objectAtIndex:i];
-            NSString *nm = nil, *bid = nil;
-            SEL sName = NSSelectorFromString(@"localizedName");
-            if ([proxy respondsToSelector:sName])
-                nm = ((id (*)(id, SEL))objc_msgSend)(proxy, sName);
+            NSString *bid = nil;
             SEL sBid = NSSelectorFromString(@"applicationIdentifier");
             if ([proxy respondsToSelector:sBid])
                 bid = ((id (*)(id, SEL))objc_msgSend)(proxy, sBid);
-            if (!nm.length || !bid.length) continue;
-            if ([nm isEqualToString:name]) {
+            if (!bid.length) continue;
+            NSString *nm = nil;
+            for (NSString *sName in @[@"localizedName", @"displayName", @"name"]) {
+                SEL s = NSSelectorFromString(sName);
+                if ([proxy respondsToSelector:s]) {
+                    id v = ((id (*)(id, SEL))objc_msgSend)(proxy, s);
+                    if ([v isKindOfClass:[NSString class]] && [v length]) { nm = (NSString *)v; break; }
+                }
+            }
+            if (!nm.length) continue;
+            NSString *nmN = NTM_normName(nm);
+            if (!nmN) continue;
+            if ([nmN isEqualToString:target]) {
                 if (!exact) exact = bid;
-            } else if (nm.length > partialLen && [name rangeOfString:nm].location != NSNotFound) {
-                partial = bid;
-                partialLen = nm.length;
+            } else if (nmN.length > partialLen && [target rangeOfString:nmN].location != NSNotFound) {
+                partial = bid; partialLen = nmN.length;
+            } else if (target.length > nmN.length && [nmN rangeOfString:target].location != NSNotFound) {
+                partial = bid; partialLen = target.length;
             }
             if (exact) break;
         }
@@ -678,6 +697,76 @@ static NSString *NTM_extractNetAuthAppName(NSString *full) {
     return nil;
 }
 
+// ===== 2.3.32: 更可靠的 bundle id 解析（前台 App 兜底） =====
+// 之前 2.3.31 的兜底 hook 能命中弹窗，却因「中文 App 名 → bundle id」解析失败而回退到系统展示。
+// 这里加两道兜底：① 规范化中文名后再匹配（规避 NFC/NFKC 差异）；② 实在解析不到时，用前台 App
+// 的 bundle id（网络授权弹窗由前台 App 触发，前台 App 即目标 App）。
+
+// SpringBoard 前台 App 的 bundle id
+static NSString *NTM_frontmostBundleId(void) {
+    if (!NTM_isSpringBoard()) return nil;
+    @try {
+        id ctrl = nil;
+        Class ctrlCls = NSClassFromString(@"SBApplicationController");
+        if (ctrlCls && [ctrlCls respondsToSelector:NSSelectorFromString(@"sharedInstance")])
+            ctrl = ((id (*)(id, SEL))objc_msgSend)(ctrlCls, NSSelectorFromString(@"sharedInstance"));
+        if (!ctrl) {
+            Class wsCls = NSClassFromString(@"SBWorkspace");
+            if (wsCls && [wsCls respondsToSelector:NSSelectorFromString(@"sharedInstance")])
+                ctrl = ((id (*)(id, SEL))objc_msgSend)(wsCls, NSSelectorFromString(@"sharedInstance"));
+        }
+        if (!ctrl) return nil;
+        NSArray *sels = @[@"frontmostApplication", @"currentActiveApplication"];
+        for (NSString *sn in sels) {
+            SEL s = NSSelectorFromString(sn);
+            if ([ctrl respondsToSelector:s]) {
+                id app = ((id (*)(id, SEL))objc_msgSend)(ctrl, s);
+                if (app && [app respondsToSelector:@selector(bundleIdentifier)]) {
+                    NSString *bid = [app bundleIdentifier];
+                    if (bid.length) return bid;
+                }
+            }
+        }
+    } @catch (NSException *e) {}
+    return nil;
+}
+
+// 从 alert item（SBUserNotificationAlert 等）聚合所有文本字段，用于网络授权关键词匹配
+static NSString *NTM_alertItemText(id item) {
+    if (!item) return nil;
+    NSMutableString *s = [NSMutableString string];
+    NSArray *keys = @[@"alertHeader", @"alertBody", @"alertTitle", @"title", @"message",
+                      @"informativeText", @"content", @"alertText", @"header", @"body", @"text"];
+    for (NSString *k in keys) {
+        @try {
+            id v = [item valueForKey:k];
+            if ([v isKindOfClass:[NSString class]] && [v length]) [s appendFormat:@" %@", v];
+        } @catch (NSException *e) {}
+        @try {
+            SEL sel = NSSelectorFromString([k stringByAppendingString:@":"]);
+            if ([item respondsToSelector:sel]) {
+                id v = ((id (*)(id, SEL))objc_msgSend)(item, sel);
+                if ([v isKindOfClass:[NSString class]] && [v length]) [s appendFormat:@" %@", v];
+            }
+        } @catch (NSException *e) {}
+    }
+    return [s length] ? s : nil;
+}
+
+// 综合解析网络授权弹窗对应的 bundle id：
+//   1) 文本提取 App 名 → LSApplicationWorkspace（规范化匹配，含 displayName）
+//   2) 兜底：前台 App
+static NSString *NTM_resolveNetAlertBundleId(NSString *text) {
+    NSString *appName = NTM_extractNetAuthAppName(text);
+    if (appName.length) {
+        NSString *bid = NTM_bundleIdOfName(appName);
+        if (bid.length) return bid;
+    }
+    NSString *fm = NTM_frontmostBundleId();
+    if (fm.length) return fm;
+    return nil;
+}
+
 // 通用系统 alert hook：检查弹窗内容，如果是网络授权弹窗，按策略处理
 // 用于 _UISystemAlertViewController showWithCompletion: 和 SBAuthorizationDialogController showWithCompletion:
 static void (*orig_showAlertCompletion)(id, SEL, id);
@@ -734,25 +823,28 @@ static void hook_showAlertCompletion(id self, SEL _cmd, id completion) {
 static void (*orig_presentVC)(id, SEL, id, BOOL, id);
 static void hook_presentVC(id self, SEL _cmd, id toPresent, BOOL animated, id completion) {
     @try {
-        // 只处理 UIAlertController
-        if ([toPresent isKindOfClass:[UIAlertController class]]) {
+        // 处理 UIAlertController 及其私有子类（如 _SBAlertController）
+        Class uac = [UIAlertController class];
+        BOOL isAC = (uac && [toPresent isKindOfClass:uac]);
+        if (!isAC) {
+            NSString *cn = NSStringFromClass([toPresent class]);
+            if ([cn rangeOfString:@"AlertController"].location != NSNotFound) isAC = YES;
+        }
+        if (isAC) {
             UIAlertController *ac = (UIAlertController *)toPresent;
             NSMutableString *text = [NSMutableString stringWithFormat:@"%@ %@",
                                      ac.title ?: @"", ac.message ?: @""];
             for (UIAlertAction *act in ac.actions) {
                 [text appendFormat:@" %s ", act.title.UTF8String ?: ""];
             }
-            // actionSheetCustomActions 在 iOS 16 已移除，用 actions 代替
             NSString *full = [text copy];
             if (NTM_isNetAuthPopup(full)) {
-                NTM_diagLog([NSString stringWithFormat:@"presentVC INTERCEPT UIAlertController title=%@ message=%@", ac.title, ac.message]);
-                // title 往往是 "错误"，权限文本在 message，所以用完整文本提取 App 名
-                NSString *appName = NTM_extractNetAuthAppName(full);
-                NSString *bid = nil;
-                if (appName.length) bid = NTM_bundleIdOfName(appName);
+                NTM_diagLog([NSString stringWithFormat:@"presentVC INTERCEPT title=%@ message=%@", ac.title, ac.message]);
+                // 2.3.32: 综合解析 bundle id（名字规范化 + 前台 App 兜底）
+                NSString *bid = NTM_resolveNetAlertBundleId(full);
                 if (!bid.length) {
-                    NTM_diagLog([NSString stringWithFormat:@"presentVC FAIL extract title=%@ message=%@", ac.title, ac.message]);
-                    if (orig_presentVC) orig_presentVC(self, _cmd, toPresent, animated, completion);
+                    // 仍解析不到：宁可吞掉弹窗（不展示）也不要回退到系统弹窗
+                    NTM_diagLog([NSString stringWithFormat:@"presentVC NO bid -> suppress title=%@ message=%@", ac.title, ac.message]);
                     return;
                 }
                 NSInteger net = NTM_netRead(bid);
@@ -772,6 +864,47 @@ static void hook_presentVC(id self, SEL _cmd, id toPresent, BOOL animated, id co
         NTM_diagLog([NSString stringWithFormat:@"presentVC EXC %@", e.reason]);
     }
     if (orig_presentVC) orig_presentVC(self, _cmd, toPresent, animated, completion);
+}
+
+#pragma mark - 2.3.32: 源头拦截 SBAlertItemsController（在 alert controller 构建前）
+// 比 presentViewController: 更靠前：直接拿到 SBUserNotificationAlert 这个 alert item，
+// 不依赖 UIAlertController 类层级判断；解析到 bundle id 后写入 allow 策略并吞掉弹窗。
+static void (*orig_presentAlertItem)(id, SEL, id, id, BOOL);
+static void hook_presentAlertItem(id self, SEL _cmd, id item, id presenter, BOOL animated) {
+    @try {
+        if (!item) {
+            if (orig_presentAlertItem) orig_presentAlertItem(self, _cmd, item, presenter, animated);
+            return;
+        }
+        NSString *text = NTM_alertItemText(item);
+        if (!NTM_isNetAuthPopup(text)) {
+            if (orig_presentAlertItem) orig_presentAlertItem(self, _cmd, item, presenter, animated);
+            return;
+        }
+        NTM_diagLog([NSString stringWithFormat:@"presentAlertItem NETALERT item=%@ text=%@",
+                     NSStringFromClass([item class]), text]);
+        NSString *bid = NTM_resolveNetAlertBundleId(text);
+        if (!bid.length) {
+            // 兜底也解析不到：吞掉弹窗，避免回退到系统弹窗（宁可少弹，不误放）
+            NTM_diagLog(@"presentAlertItem NO bid -> suppress (fallback failed)");
+            return;
+        }
+        NSInteger net = NTM_netRead(bid);
+        BOOL bgNet = NTM_bgNetOn(bid);
+        if (net == 1 || bgNet) {
+            NTM_diagLog([NSString stringWithFormat:@"presentAlertItem DENY bid=%@", bid]);
+            return;
+        }
+        if (!NTM_isAppConfigured(bid)) {
+            NTM_syncCellularSB(bid, 0); // 新安装 App 写 allow 策略
+            NTM_diagLog([NSString stringWithFormat:@"presentAlertItem ALLOW+write bid=%@", bid]);
+            return;
+        }
+        if (orig_presentAlertItem) orig_presentAlertItem(self, _cmd, item, presenter, animated);
+    } @catch (NSException *e) {
+        NTM_diagLog([NSString stringWithFormat:@"presentAlertItem EXC %@", e.reason]);
+        if (orig_presentAlertItem) orig_presentAlertItem(self, _cmd, item, presenter, animated);
+    }
 }
 
 static void tryHook(Class cls, SEL sel, IMP hook, IMP *orig) {
@@ -1141,9 +1274,16 @@ __attribute__((constructor)) static void init() {
         // SpringBoard 的 UIViewController 子类（如 _SBSheetAlertController）也可能走这个 API
         // 但 SpringBoard 自己有个 presentVC 包装类，先跳过以免误伤系统其他弹窗
 
+        // ===== 2.3.32: 源头拦截（SBAlertItemsController）=====
+        // 在 alert controller 构建前直接拿到 SBUserNotificationAlert，不依赖 UIAlertController 类层级，
+        // 并加入「前台 App bundle id 兜底」，彻底解决 2.3.31「能命中弹窗但 bundle id 解析失败→回退弹出」的问题。
+        tryHook(objc_getClass("SBAlertItemsController"),
+                sel_registerName("_presentAlertItem:withPresenter:animated:"),
+                (IMP)hook_presentAlertItem, (IMP *)&orig_presentAlertItem);
+
         // 诊断日志：记录 init 完成
         if (NTM_isSpringBoard()) {
-            NTM_diagLog(@"init DONE v2.3.31");
+            NTM_diagLog(@"init DONE v2.3.32");
         }
     }
 }
