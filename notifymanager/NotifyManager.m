@@ -1522,6 +1522,16 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
         else if (_filter == 3) { if (NTM_netRead(app[@"id"]) != 1) continue; }
         [filtered addObject:app];
     }
+    // "最近"模式下按安装时间倒序：最新安装的排第一
+    if (_showRecent) {
+        [filtered sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b) {
+            NSDate *da = a[@"installDate"];
+            NSDate *db = b[@"installDate"];
+            if (!da) return NSOrderedDescending;
+            if (!db) return NSOrderedAscending;
+            return [db compare:da]; // 倒序：最新的排第一
+        }];
+    }
     _curApps = filtered;
 
     if (!filtered.count) {
