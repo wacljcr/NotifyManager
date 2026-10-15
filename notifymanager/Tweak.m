@@ -420,13 +420,21 @@ static NSUInteger hook_shouldShowLaunchAlert(id self, SEL _cmd, id app) {
     NSInteger net = NTM_netRead(bid);
     BOOL bgNet = NTM_bgNetOn(bid);
     // 断网 / 后台断网 → 不展示（和原来一致）
-    if (net == 1 || bgNet) return 0;
+    if (net == 1 || bgNet) {
+        NTM_diagLog([NSString stringWithFormat:@"launchEval DENY bid=%@", bid]);
+        return 0;
+    }
     // 面板已配置且非断网 → 让系统走原始逻辑（蜂窝策略已由面板写入系统）
     if (NTM_isAppConfigured(bid)) {
         if (orig_shouldShowLaunchAlert) return orig_shouldShowLaunchAlert(self, _cmd, app);
         return 0;
     }
-    // 面板未配置（新安装 App）→ 默认允许 WiFi+蜂窝，不弹窗
+    // 面板未配置（新安装 App）→ 默认允许 WiFi+蜂窝：写系统策略 + 不弹窗
+    // 关键修复 (2.3.35)：本机 iOS 16.6 的网络授权弹窗走 SBApplicationLaunchAlertEvaluator /
+    // SBApplicationLaunchAlertService（SBUserNotificationCenter.dispatchUserNotification 此 selector
+    // 在本机不存在），所以必须在「压弹窗」的同时写允许策略，否则只压弹窗、不授权 → App 没网。
+    NTM_diagLog([NSString stringWithFormat:@"launchEval ALLOW+write bid=%@ port=n/a", bid]);
+    NTM_syncCellularSB(bid, 0); // 写系统蜂窝策略（wifi+流量允许）
     return 0;
 }
 static void (*orig_showLaunchAlert)(id, SEL, NSUInteger, id);
@@ -438,12 +446,17 @@ static void hook_showLaunchAlert(id self, SEL _cmd, NSUInteger type, id app) {
     }
     NSInteger net = NTM_netRead(bid);
     BOOL bgNet = NTM_bgNetOn(bid);
-    if (net == 1 || bgNet) return;
+    if (net == 1 || bgNet) {
+        NTM_diagLog([NSString stringWithFormat:@"launchShow DENY bid=%@", bid]);
+        return;
+    }
     if (NTM_isAppConfigured(bid)) {
         if (orig_showLaunchAlert) orig_showLaunchAlert(self, _cmd, type, app);
         return;
     }
-    // 面板未配置（新安装 App）→ 不弹窗
+    // 面板未配置（新安装 App）→ 写允许策略 + 不弹窗（与 launchEval 同路兜底）
+    NTM_diagLog([NSString stringWithFormat:@"launchShow ALLOW+write bid=%@ type=%lu", bid, (unsigned long)type]);
+    NTM_syncCellularSB(bid, 0);
 }
 
 #pragma mark - 直接拦截 CommCenter 的「允许"XX"使用无线数据」请求（不弹窗）
@@ -1287,10 +1300,11 @@ __attribute__((constructor)) static void init() {
                 sel_registerName("_presentAlertItem:withPresenter:animated:"),
                 (IMP)hook_presentAlertItem, (IMP *)&orig_presentAlertItem);
 
-        // 诊断日志：记录 init 完成 + 关键 hook 是否装上（dispatch 是网络弹窗的唯一可靠处理点）
+        // 诊断日志：记录 init 完成 + 关键 hook 是否装上
         if (NTM_isSpringBoard()) {
             NTM_diagLog([NSString stringWithFormat:
-                @"init DONE v2.3.34 hooks: dispatch=%d presentAlertItem=%d presentVC=%d",
+                @"init DONE v2.3.35 hooks: launchEval=%d launchShow=%d dispatch=%d presentAlertItem=%d presentVC=%d",
+                (orig_shouldShowLaunchAlert != NULL), (orig_showLaunchAlert != NULL),
                 (orig_dispatch != NULL), (orig_presentAlertItem != NULL), (orig_presentVC != NULL)]);
         }
     }
