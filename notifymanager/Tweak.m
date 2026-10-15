@@ -728,8 +728,9 @@ static void hook_showAlertCompletion(id self, SEL _cmd, id completion) {
 }
 
 // 更激进：hook UIViewController 的 presentViewController:animated:completion:
-// iOS 16 上系统级授权弹窗通过 UIAlertController + presentViewControllerAnimated: 展示
+// iOS 16 上系统级授权弹窗通过 UIAlertController + presentViewController:animated:completion: 展示
 // 检测 toPresent 是否是 UIAlertController，且内容是网络授权弹窗
+// 注意：弹窗 title 常是 "错误"，权限文本在 message 里，所以要从 title+message+actions 一起提取 App 名
 static void (*orig_presentVC)(id, SEL, id, BOOL, id);
 static void hook_presentVC(id self, SEL _cmd, id toPresent, BOOL animated, id completion) {
     @try {
@@ -744,11 +745,13 @@ static void hook_presentVC(id self, SEL _cmd, id toPresent, BOOL animated, id co
             // actionSheetCustomActions 在 iOS 16 已移除，用 actions 代替
             NSString *full = [text copy];
             if (NTM_isNetAuthPopup(full)) {
-                NTM_diagLog([NSString stringWithFormat:@"presentVC INTERCEPT UIAlertController title=%@", ac.title]);
-                NSString *appName = NTM_extractNetAuthAppName(ac.title ?: @"");
+                NTM_diagLog([NSString stringWithFormat:@"presentVC INTERCEPT UIAlertController title=%@ message=%@", ac.title, ac.message]);
+                // title 往往是 "错误"，权限文本在 message，所以用完整文本提取 App 名
+                NSString *appName = NTM_extractNetAuthAppName(full);
                 NSString *bid = nil;
                 if (appName.length) bid = NTM_bundleIdOfName(appName);
                 if (!bid.length) {
+                    NTM_diagLog([NSString stringWithFormat:@"presentVC FAIL extract title=%@ message=%@", ac.title, ac.message]);
                     if (orig_presentVC) orig_presentVC(self, _cmd, toPresent, animated, completion);
                     return;
                 }
@@ -1129,17 +1132,18 @@ __attribute__((constructor)) static void init() {
                 sel_registerName(@"showWithCompletion:"),
                 (IMP)hook_showAlertCompletion, (IMP *)&orig_showAlertCompletion);
         // 更激进：hook UIViewController 的 presentViewController:animated:completion:
-        // iOS 16+ 系统级授权弹窗通过 UIAlertController + presentViewControllerAnimated: 展示
-        // 这是最通用的兜底，覆盖所有通过 present API 展示的 UIAlertController
+        // iOS 16+ 系统级授权弹窗通过 UIAlertController + presentViewController:animated:completion: 展示
+        // 注意：之前 selector 写错成 presentViewControllerAnimated:completion:（缺第一个冒号），导致兜底 hook 根本没装上
+        // 修复后用正确 selector，并从完整文本（title+message+actions）提取 App 名
         tryHook(objc_getClass("UIViewController"),
-                sel_registerName("presentViewControllerAnimated:completion:"),
+                sel_registerName("presentViewController:animated:completion:"),
                 (IMP)hook_presentVC, (IMP *)&orig_presentVC);
         // SpringBoard 的 UIViewController 子类（如 _SBSheetAlertController）也可能走这个 API
         // 但 SpringBoard 自己有个 presentVC 包装类，先跳过以免误伤系统其他弹窗
 
         // 诊断日志：记录 init 完成
         if (NTM_isSpringBoard()) {
-            NTM_diagLog(@"init DONE v2.3.30");
+            NTM_diagLog(@"init DONE v2.3.31");
         }
     }
 }
