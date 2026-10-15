@@ -13,11 +13,11 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     steps:
-      - name: Checkout Cydia repo
-        uses: actions/checkout@v4
-        with:
-          repository: wacljcr/mumu
-          token: ${{ secrets.GH_TOKEN }}
+      - name: Setup
+        run: |
+          echo "Workflow: ${GITHUB_WORKFLOW}"
+          echo "Run ID: ${{ github.event.workflow_run.id }}"
+          echo "Event name: ${{ github.event.workflow_run.name }}"
 
       - name: Download CarCheckPlugin deb artifact
         if: ${{ github.event.workflow_run.name == 'build-tipa' }}
@@ -26,7 +26,6 @@ jobs:
           name: CarCheckPlugin
           path: ./debs/
           run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ github.token }}
 
       - name: Download NotifyManager deb artifact
         if: ${{ github.event.workflow_run.name == 'build-notify' }}
@@ -34,37 +33,44 @@ jobs:
         with:
           name: NotifyManager-deb
           path: ./debs/
-          run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ github.token }}
 
-      - name: Regenerate Packages
+      - name: Regenerate Packages and push
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
+          set -e
+          # Clone the repo
+          git clone https://${GH_TOKEN}@github.com/wacljcr/mumu.git repo
+          cd repo
+
+          # Create directories
           mkdir -p debian/dists/stable/main/binary-all
-          cd debs
+          mkdir -p debian/pool/main
+
+          # Copy debs to pool
+          cp ../../debs/*.deb debian/pool/main/ 2>/dev/null || true
+
+          # Generate Packages file
+          cd debian/pool/main
+          > ../../dists/stable/main/binary-all/Packages
           for deb in *.deb; do
             [ -f "$deb" ] || continue
-            dpkg-deb -f "$deb" > /tmp/control
-            cat /tmp/control
-            echo "Filename: ./debian/pool/main/$(basename $deb)"
-            echo "Size: $(stat -c%s "$deb")"
-            echo "MD5sum: $(md5sum "$deb" | cut -d' ' -f1)"
-            echo "SHA1: $(sha1sum "$deb" | cut -d' ' -f1)"
-            echo "SHA256: $(sha256sum "$deb" | cut -d' ' -f1)"
-            echo ""
-          done > ../Packages
-          cd ..
-          bzip2 -zkf Packages
-          echo "Packages regenerated"
+            dpkg-deb -f "$deb" >> ../../dists/stable/main/binary-all/Packages
+            echo "Filename: ./debian/pool/main/$deb" >> ../../dists/stable/main/binary-all/Packages
+            echo "Size: $(stat -c%s "$deb")" >> ../../dists/stable/main/binary-all/Packages
+            echo "MD5sum: $(md5sum "$deb" | cut -d' ' -f1)" >> ../../dists/stable/main/binary-all/Packages
+            echo "SHA1: $(sha1sum "$deb" | cut -d' ' -f1)" >> ../../dists/stable/main/binary-all/Packages
+            echo "SHA256: $(sha256sum "$deb" | cut -d' ' -f1)" >> ../../dists/stable/main/binary-all/Packages
+            echo "" >> ../../dists/stable/main/binary-all/Packages
+          done
+          cd ../../..
 
-      - name: Copy debs to pool
-        run: |
-          mkdir -p debian/pool/main
-          cp debs/*.deb debian/pool/main/ 2>/dev/null || true
-          echo "Debs copied"
+          # Create Packages.bz2
+          bzip2 -k debian/dists/stable/main/binary-all/Packages
+          cp debian/dists/stable/main/binary-all/Packages.bz2 debian/dists/stable/main/binary-all/
 
-      - name: Update Release
-        run: |
-          cat > Release << 'EOF'
+          # Update Release file
+          cat > Release << EOF
           Origin: NTM Jailbreak Repo
           Label: NTM Repo
           Suite: stable
@@ -77,17 +83,16 @@ jobs:
           EOF
           echo "Date: $(date -R)" >> Release
           echo "MD5Sum:" >> Release
-          echo " $(md5sum Packages | cut -d' ' -f1) $(stat -c%s Packages) Packages" >> Release
-          echo " $(md5sum Packages.bz2 | cut -d' ' -f1) $(stat -c%s Packages.bz2) Packages.bz2" >> Release
+          echo " $(md5sum debian/dists/stable/main/binary-all/Packages | cut -d' ' -f1) $(stat -c%s debian/dists/stable/main/binary-all/Packages) debian/dists/stable/main/binary-all/Packages" >> Release
+          echo " $(md5sum debian/dists/stable/main/binary-all/Packages.bz2 | cut -d' ' -f1) $(stat -c%s debian/dists/stable/main/binary-all/Packages.bz2) debian/dists/stable/main/binary-all/Packages.bz2" >> Release
           echo "SHA1:" >> Release
-          echo " $(sha1sum Packages | cut -d' ' -f1) $(stat -c%s Packages) Packages" >> Release
-          echo " $(sha1sum Packages.bz2 | cut -d' ' -f1) $(stat -c%s Packages.bz2) Packages.bz2" >> Release
+          echo " $(sha1sum debian/dists/stable/main/binary-all/Packages | cut -d' ' -f1) $(stat -c%s debian/dists/stable/main/binary-all/Packages) debian/dists/stable/main/binary-all/Packages" >> Release
+          echo " $(sha1sum debian/dists/stable/main/binary-all/Packages.bz2 | cut -d' ' -f1) $(stat -c%s debian/dists/stable/main/binary-all/Packages.bz2) debian/dists/stable/main/binary-all/Packages.bz2" >> Release
           echo "SHA256:" >> Release
-          echo " $(sha256sum Packages | cut -d' ' -f1) $(stat -c%s Packages) Packages" >> Release
-          echo " $(sha256sum Packages.bz2 | cut -d' ' -f1) $(stat -c%s Packages.bz2) Packages.bz2" >> Release
+          echo " $(sha256sum debian/dists/stable/main/binary-all/Packages | cut -d' ' -f1) $(stat -c%s debian/dists/stable/main/binary-all/Packages) debian/dists/stable/main/binary-all/Packages" >> Release
+          echo " $(sha256sum debian/dists/stable/main/binary-all/Packages.bz2 | cut -d' ' -f1) $(stat -c%s debian/dists/stable/main/binary-all/Packages.bz2) debian/dists/stable/main/binary-all/Packages.bz2" >> Release
 
-      - name: Commit and Push
-        run: |
+          # Commit and push
           git config user.name "github-actions[bot]"
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
