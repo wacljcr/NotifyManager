@@ -40,6 +40,27 @@ static NSUserDefaults *NTM_prefs(void) {
     return prefs;
 }
 
+// ===== 2.3.30 新增：诊断日志 =====
+// 用户可通过 Settings → 面板 查看 hook 触发记录，定位为什么弹窗仍出现。
+// 存到 NSUserDefaults suite，最多保留 50 条。
+static void NTM_diagLog(NSString *msg) {
+    @try {
+        NSMutableArray *log = [[NTM_prefs() objectForKey:@"NTM_diagLog"] mutableCopy] ?: [NSMutableArray array];
+        NSString *stamp = [NSString stringWithFormat:@"%@ %@",
+                           [NSDateFormatter localizedStringFromDate:[NSDate date]
+                                                            dateStyle:NSDateFormatterNoStyle
+                                                           timeStyle:NSDateFormatterShortStyle],
+                           msg];
+        // SpringBoard 进程名前缀
+        NSString *procName = [[[NSProcessInfo processInfo] arguments] objectAtIndex:0];
+        stamp = [NSString stringWithFormat:@"[%@] %@", procName, stamp];
+        [log insertObject:stamp atIndex:0];
+        if (log.count > 50) [log setArray:[log subarrayWithRange:NSMakeRange(log.count - 50, 50)]];
+        [[NTM_prefs()] setObject:log forKey:@"NTM_diagLog"];
+    } @catch(NSException *e) {}
+}
+}
+
 // 内存缓存：key=NTM_<dim>_<appId> -> NSNumber，通知到达时零 I/O 读取
 static NSMutableDictionary *NTM_cache(void) {
     static NSMutableDictionary *cache = nil;
@@ -617,40 +638,139 @@ static void hook_dispatch(id self, SEL _cmd, id msg, uint64_t flags,
     if (orig_dispatch) orig_dispatch(self, _cmd, msg, flags, replyPort, auditToken);
 }
 
-// ===== 2.3.25 新增：SBSheetAlertController 展示层兜底 hook =====
-// 如果 dispatchUserNotification 方法不存在（重命名/移除），弹窗仍会经
-// SBSheetAlertController 的 showWithCompletion: 展示。此 hook 在展示层
-// 拦截网络弹窗，用名字解析识别 App 后按策略处理。
+// ===== 2.3.30 新增：iOS 16+ 系统级授权弹窗拦截 =====
+// iOS 16+ 无线数据权限弹窗不走 dispatchUserNotification（旧通知 API），
+// 走的是 SpringBoard 内部的 _UISystemAlertViewController / SBAuthorizationDialogController。
+// 通用检测：文本含"无线数据/蜂窝数据/使用数据/访问数据"即为网络授权弹窗。
+// 断网 App → 吞掉弹窗；新 App → 写策略后吞掉。
+static BOOL NTM_isNetAuthPopup(NSString *full) {
+    if (!full.length) return NO;
+    return [full containsString:@"无线数据"] ||
+           [full containsString:@"蜂窝数据"] ||
+           [full containsString:@"使用数据"] ||
+           [full containsString:@"访问数据"] ||
+           [full containsString:@"无线局域网与蜂窝网络"];
+}
+
+// 从「允许"XX"使用无线数据？」提取 App 名（支持多种引号）
+static NSString *NTM_extractNetAuthAppName(NSString *full) {
+    if (!full.length) return nil;
+    NSRange allow = [full rangeOfString:@"允许"];
+    NSRange wireless = [full rangeOfString:@"使用无线数据"] ?: [full rangeOfString:@"使用蜂窝数据"] ?: [full rangeOfString:@"访问数据"];
+    if (allow.location == NSNotFound || wireless.location == NSNotFound || wireless.location <= allow.location + allow.length) return nil;
+    NSString *mid = [full substringWithRange:NSMakeRange(allow.location + allow.length, wireless.location - allow.location - allow.length)];
+    // 尝试多种引号
+    NSArray *pairs = @[
+        @[@"\u201C", @"\u201D"],  // ""
+        @[@"\u300C", @"\u300D"],  // 「」
+        @[@"\u300E", @"\u300F"],  // 《》
+        @[@"\"", @"\""]           // ""
+    ];
+    for (NSArray *p in pairs) {
+        NSRange ro = [mid rangeOfString:p[0]];
+        if (ro.location == NSNotFound) continue;
+        NSString *after = [mid substringFromIndex:ro.location + 1];
+        NSRange rc = [after rangeOfString:p[1]];
+        if (rc.location != NSNotFound && rc.location > 0) {
+            return [after substringToIndex:rc.location];
+        }
+    }
+    return nil;
+}
+
+// 通用系统 alert hook：检查弹窗内容，如果是网络授权弹窗，按策略处理
+// 用于 _UISystemAlertViewController showWithCompletion: 和 SBAuthorizationDialogController showWithCompletion:
 static void (*orig_showAlertCompletion)(id, SEL, id);
 static void hook_showAlertCompletion(id self, SEL _cmd, id completion) {
     NSString *text = nil, *info = nil;
     @try { text = [self valueForKey:@"text"]; } @catch(NSException *e) {}
     @try { info = [self valueForKey:@"informativeText"]; } @catch(NSException *e) {}
+    // 有些类用 title/message
+    if (!text) { @try { text = [self valueForKey:@"title"]; } @catch(NSException *e) {} }
+    if (!info) { @try { info = [self valueForKey:@"message"]; } @catch(NSException *e) {} }
     NSString *full = [NSString stringWithFormat:@"%@ %@", text ?: @"", info ?: @""];
-    BOOL isNetPopup = [full containsString:@"无线数据"] ||
-                      [full containsString:@"蜂窝数据"] ||
-                      [full containsString:@"使用数据"] ||
-                      [full containsString:@"访问数据"];
+    BOOL isNetPopup = NTM_isNetAuthPopup(full);
     if (!isNetPopup) {
         if (orig_showAlertCompletion) orig_showAlertCompletion(self, _cmd, completion);
         return;
     }
-    // 尝试解析 App 名
-    NSString *appName = NTM_appNameOfHeader(full);
+    // 是网络权限弹窗
+    NTM_diagLog([NSString stringWithFormat:@"netAuth INTERCEPT text=%@ info=%@", text, info]);
+    // 尝试从消息文本提取 bundle id（auditToken 在此不可用，只能靠名字）
     NSString *bid = nil;
-    if (appName.length) bid = NTM_bundleIdOfName(appName);
+    @try {
+        // 有些类有 auditToken 属性
+        void *at = [self valueForKey:@"auditToken"];
+        if (at) bid = NTM_bundleIdFromAuditToken(at);
+    } @catch(NSException *e) {}
+    // 回退：从文本解析 App 名
     if (!bid.length) {
+        NSString *appName = NTM_extractNetAuthAppName(full);
+        if (appName.length) bid = NTM_bundleIdOfName(appName);
+    }
+    if (!bid.length) {
+        NTM_diagLog(@"netAuth FAIL noBundleId fallback");
         if (orig_showAlertCompletion) orig_showAlertCompletion(self, _cmd, completion);
         return;
     }
     NSInteger net = NTM_netRead(bid);
     BOOL bgNet = NTM_bgNetOn(bid);
-    if (net == 1 || bgNet) return; // 断网 → 不展示
+    if (net == 1 || bgNet) {
+        NTM_diagLog([NSString stringWithFormat:@"netAuth DENY bid=%@", bid]);
+        return; // 断网 → 不展示
+    }
     if (!NTM_isAppConfigured(bid)) {
         NTM_syncCellularSB(bid, 0); // 新 App 写入 allow 策略
-        return;
+        NTM_diagLog([NSString stringWithFormat:@"netAuth ALLOW+write bid=%@", bid]);
+        return; // 写入策略后也不展示（策略已允许）
     }
     if (orig_showAlertCompletion) orig_showAlertCompletion(self, _cmd, completion);
+}
+
+// 更激进：hook UIViewController 的 presentViewController:animated:completion:
+// iOS 16 上系统级授权弹窗通过 UIAlertController + presentViewControllerAnimated: 展示
+// 检测 toPresent 是否是 UIAlertController，且内容是网络授权弹窗
+static void (*orig_presentVC)(id, SEL, id, BOOL, id);
+static void hook_presentVC(id self, SEL _cmd, id toPresent, BOOL animated, id completion) {
+    @try {
+        // 只处理 UIAlertController
+        if ([toPresent isKindOfClass:[UIAlertController class]]) {
+            UIAlertController *ac = (UIAlertController *)toPresent;
+            NSMutableString *text = [NSMutableString stringWithFormat:@"%@ %@",
+                                     ac.title ?: @"", ac.message ?: @""];
+            for (UIAlertAction *act in ac.actions) {
+                [text appendFormat:@" %s ", act.title.UTF8String ?: ""];
+            }
+            for (UIAlertAction *sact in ac.actionSheetCustomActions) {
+                [text appendFormat:@" %s ", sact.title.UTF8String ?: ""];
+            }
+            NSString *full = [text copy];
+            if (NTM_isNetAuthPopup(full)) {
+                NTM_diagLog([NSString stringWithFormat:@"presentVC INTERCEPT UIAlertController title=%@", ac.title]);
+                NSString *appName = NTM_extractNetAuthAppName(ac.title ?: @"");
+                NSString *bid = nil;
+                if (appName.length) bid = NTM_bundleIdOfName(appName);
+                if (!bid.length) {
+                    if (orig_presentVC) orig_presentVC(self, _cmd, toPresent, animated, completion);
+                    return;
+                }
+                NSInteger net = NTM_netRead(bid);
+                BOOL bgNet = NTM_bgNetOn(bid);
+                if (net == 1 || bgNet) {
+                    NTM_diagLog([NSString stringWithFormat:@"presentVC DENY bid=%@", bid]);
+                    return;
+                }
+                if (!NTM_isAppConfigured(bid)) {
+                    NTM_syncCellularSB(bid, 0);
+                    NTM_diagLog([NSString stringWithFormat:@"presentVC ALLOW+write bid=%@", bid]);
+                    return;
+                }
+            }
+        }
+    } @catch(NSException *e) {
+        NTM_diagLog([NSString stringWithFormat:@"presentVC EXC %@", e.reason]);
+    }
+    if (orig_presentVC) orig_presentVC(self, _cmd, toPresent, animated, completion);
 }
 
 static void tryHook(Class cls, SEL sel, IMP hook, IMP *orig) {
@@ -753,6 +873,7 @@ static void NTM_loadPolicyFramework(void) {
 }
 
 // 按面板配置写 PSAppDataUsagePolicyCache（和 NotifyManager.m 完全一致的调用路径）
+// 2.3.30: 尝试多个可能的 API（不同 iOS 版本 API 名不同），加诊断日志
 static void NTM_syncCellularSB(NSString *appId, NSInteger policy) {
     if (!appId.length) return;
     // policy: 0=wifi+流量 1=断网 2=只wifi 3=只流量；系统侧 1=允许 0=禁止
@@ -761,35 +882,80 @@ static void NTM_syncCellularSB(NSString *appId, NSInteger policy) {
     NTM_loadPolicyFramework();
     @try {
         Class cls = NSClassFromString(@"PSAppDataUsagePolicyCache");
-        if (!cls) return;
+        if (!cls) { NTM_diagLog([NSString stringWithFormat:@"syncPol SKIP noClass bid=%@", appId]); return; }
         id cache = ((id (*)(id, SEL))objc_msgSend)(cls, NSSelectorFromString(@"sharedInstance"));
-        if (!cache) return;
+        if (!cache) { NTM_diagLog([NSString stringWithFormat:@"syncPol SKIP noCache bid=%@", appId]); return; }
         id pol = nil;
-        SEL selPoliciesFor = NSSelectorFromString(@"policiesFor:");
-        if ([cache respondsToSelector:selPoliciesFor])
-            pol = ((id (*)(id, SEL, id))objc_msgSend)(cache, selPoliciesFor, appId);
+        // 尝试多种 policiesFor 方法名
+        SEL s1 = NSSelectorFromString(@"policiesFor:");
+        SEL s2 = NSSelectorFromString(@"policiesForBundleIdentifier:");
+        SEL s3 = NSSelectorFromString(@"policiesForApplicationID:");
+        if ([cache respondsToSelector:s1]) pol = ((id (*)(id, SEL, id))objc_msgSend)(cache, s1, appId);
+        if (!pol && [cache respondsToSelector:s2]) pol = ((id (*)(id, SEL, id))objc_msgSend)(cache, s2, appId);
+        if (!pol && [cache respondsToSelector:s3]) pol = ((id (*)(id, SEL, id))objc_msgSend)(cache, s3, appId);
         if (pol) {
             SEL sCell = NSSelectorFromString(@"setCellular:");
             SEL sWifi = NSSelectorFromString(@"setWifi:");
-            if ([pol respondsToSelector:sCell])
-                ((void (*)(id, SEL, long long))objc_msgSend)(pol, sCell, cell);
-            if ([pol respondsToSelector:sWifi])
-                ((void (*)(id, SEL, long long))objc_msgSend)(pol, sWifi, wifi);
+            if ([pol respondsToSelector:sCell]) ((void (*)(id, SEL, long long))objc_msgSend)(pol, sCell, cell);
+            if ([pol respondsToSelector:sWifi])  ((void (*)(id, SEL, long long))objc_msgSend)(pol, sWifi, wifi);
         } else {
+            // 尝试多种 init 方法
             Class polCls = NSClassFromString(@"CTDataUsagePolicies");
-            SEL initSel = NSSelectorFromString(@"init:withCellularPolicy:andWifiPolicy:");
-            if (polCls && [polCls instancesRespondToSelector:initSel]) {
-                id obj = ((id (*)(id, SEL))objc_msgSend)((id)polCls, NSSelectorFromString(@"alloc"));
-                pol = ((id (*)(id, SEL, id, long long, long long))objc_msgSend)(obj, initSel, appId, cell, wifi);
+            NSArray *inits3 = @[@"init:withCellularPolicy:andWifiPolicy:",
+                                @"newPolicyWithCellularPolicy:andWifiPolicy:"];
+            NSArray *inits1 = @[@"initWithApplicationID:",
+                                @"initWithBundleIdentifier:",
+                                @"newPolicyWithApplicationID:",
+                                @"newPolicyForApplicationID:"];
+            if (polCls) {
+                for (NSString *n in inits3) {
+                    SEL s = NSSelectorFromString(n);
+                    if (![polCls instancesRespondToSelector:s]) continue;
+                    id obj = ((id (*)(id, SEL))objc_msgSend)((id)polCls, NSSelectorFromString(@"alloc"));
+                    pol = ((id (*)(id, SEL, id, long long, long long))objc_msgSend)(obj, s, appId, cell, wifi);
+                    if (pol) break;
+                }
+                if (!pol) for (NSString *n in inits1) {
+                    SEL s = NSSelectorFromString(n);
+                    if (![polCls instancesRespondToSelector:s]) continue;
+                    id obj = ((id (*)(id, SEL))objc_msgSend)((id)polCls, NSSelectorFromString(@"alloc"));
+                    pol = ((id (*)(id, SEL, id))objc_msgSend)(obj, s, appId);
+                    if (pol) {
+                        SEL sCell = NSSelectorFromString(@"setCellular:");
+                        SEL sWifi = NSSelectorFromString(@"setWifi:");
+                        if ([pol respondsToSelector:sCell]) ((void (*)(id, SEL, long long))objc_msgSend)(pol, sCell, cell);
+                        if ([pol respondsToSelector:sWifi])  ((void (*)(id, SEL, long long))objc_msgSend)(pol, sWifi, wifi);
+                        break;
+                    }
+                }
             }
         }
-        if (!pol) return;
-        SEL setPol = NSSelectorFromString(@"setPolicies:completion:");
-        if ([cache respondsToSelector:setPol]) {
+        if (!pol) { NTM_diagLog([NSString stringWithFormat:@"syncPol FAIL noPol bid=%@", appId]); return; }
+        // 尝试多种 setPolicy 方法名
+        SEL setPol1 = NSSelectorFromString(@"setPolicies:completion:");
+        SEL setPol2 = NSSelectorFromString(@"setPolicy:completion:");
+        SEL setPol3 = NSSelectorFromString(@"setPolicies:");
+        SEL setPol4 = NSSelectorFromString(@"setPolicy:");
+        if ([cache respondsToSelector:setPol1]) {
             void (^done)(void) = ^{};
-            ((void (*)(id, SEL, id, id))objc_msgSend)(cache, setPol, pol, done);
+            ((void (*)(id, SEL, id, id))objc_msgSend)(cache, setPol1, pol, done);
+            NTM_diagLog([NSString stringWithFormat:@"syncPol OK setPolicies bid=%@ cell=%lld wifi=%lld", appId, cell, wifi]);
+        } else if ([cache respondsToSelector:setPol2]) {
+            void (^done)(void) = ^{};
+            ((void (*)(id, SEL, id, id))objc_msgSend)(cache, setPol2, pol, done);
+            NTM_diagLog([NSString stringWithFormat:@"syncPol OK setPolicy bid=%@ cell=%lld wifi=%lld", appId, cell, wifi]);
+        } else if ([cache respondsToSelector:setPol3]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(cache, setPol3, pol);
+            NTM_diagLog([NSString stringWithFormat:@"syncPol OK setPolicies(sync) bid=%@", appId]);
+        } else if ([cache respondsToSelector:setPol4]) {
+            ((void (*)(id, SEL, id))objc_msgSend)(cache, setPol4, pol);
+            NTM_diagLog([NSString stringWithFormat:@"syncPol OK setPolicy(sync) bid=%@", appId]);
+        } else {
+            NTM_diagLog([NSString stringWithFormat:@"syncPol FAIL noSetter bid=%@", appId]);
         }
-    } @catch(NSException *e) {}
+    } @catch(NSException *e) {
+        NTM_diagLog([NSString stringWithFormat:@"syncPol EXC %@", e.reason]);
+    }
 }
 
 // ===== 2.3.25 新增：新安装 App 自动写入 allow 策略 =====
@@ -947,5 +1113,37 @@ __attribute__((constructor)) static void init() {
         tryHook(objc_getClass("SBSheetAlertController"),
                 sel_registerName("showWithCompletion:"),
                 (IMP)hook_showAlertCompletion, (IMP *)&orig_showAlertCompletion);
+
+        // ===== 2.3.30: iOS 16+ 系统级授权弹窗拦截 =====
+        // iOS 16+ 无线数据权限弹窗走的是 SpringBoard 内部的 _UISystemAlertViewController /
+        // SBAuthorizationDialogController，不走通知系统的 dispatchUserNotification。
+        // 这些类通过 showWithCompletion: 展示，复用 hook_showAlertCompletion 检测文本。
+        // 如果某些版本这类走 UIAlertController 的 present API，也 hook 一下。
+        // 如果某些版本这类走 UIAlertController 的 present API，也 hook 一下。
+        tryHook(NSClassFromString(@"_UISystemAlertViewController"),
+                sel_registerName(@"showWithCompletion:"),
+                (IMP)hook_showAlertCompletion, (IMP *)&orig_showAlertCompletion);
+        tryHook(NSClassFromString(@"SBAuthorizationDialogController"),
+                sel_registerName(@"showWithCompletion:"),
+                (IMP)hook_showAlertCompletion, (IMP *)&orig_showAlertCompletion);
+        tryHook(NSClassFromString(@"SBAuthorizationDialogViewController"),
+                sel_registerName(@"showWithCompletion:"),
+                (IMP)hook_showAlertCompletion, (IMP *)&orig_showAlertCompletion);
+        tryHook(NSClassFromString(@"_UIAlertControllerDialogViewController"),
+                sel_registerName(@"showWithCompletion:"),
+                (IMP)hook_showAlertCompletion, (IMP *)&orig_showAlertCompletion);
+        // 更激进：hook UIViewController 的 presentViewController:animated:completion:
+        // iOS 16+ 系统级授权弹窗通过 UIAlertController + presentViewControllerAnimated: 展示
+        // 这是最通用的兜底，覆盖所有通过 present API 展示的 UIAlertController
+        tryHook(objc_getClass("UIViewController"),
+                sel_registerName("presentViewControllerAnimated:completion:"),
+                (IMP)hook_presentVC, (IMP *)&orig_presentVC);
+        // SpringBoard 的 UIViewController 子类（如 _SBSheetAlertController）也可能走这个 API
+        // 但 SpringBoard 自己有个 presentVC 包装类，先跳过以免误伤系统其他弹窗
+
+        // 诊断日志：记录 init 完成
+        if (NTM_isSpringBoard()) {
+            NTM_diagLog(@"init DONE v2.3.30");
+        }
     }
 }
