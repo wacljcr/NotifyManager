@@ -26,7 +26,7 @@ jobs:
           name: CarCheckPlugin
           path: ./debs/
           run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ github.token }}
 
       - name: Download NotifyManager deb artifact
         if: ${{ github.event.workflow_run.name == 'build-notify' }}
@@ -35,7 +35,7 @@ jobs:
           name: NotifyManager-deb
           path: ./debs/
           run-id: ${{ github.event.workflow_run.id }}
-          github-token: ${{ secrets.GH_TOKEN }}
+          github-token: ${{ github.token }}
 
       - name: Regenerate Packages
         run: |
