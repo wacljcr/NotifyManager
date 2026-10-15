@@ -51,14 +51,12 @@ static void NTM_diagLog(NSString *msg) {
                                                             dateStyle:NSDateFormatterNoStyle
                                                            timeStyle:NSDateFormatterShortStyle],
                            msg];
-        // SpringBoard 进程名前缀
         NSString *procName = [[[NSProcessInfo processInfo] arguments] objectAtIndex:0];
         stamp = [NSString stringWithFormat:@"[%@] %@", procName, stamp];
         [log insertObject:stamp atIndex:0];
         if (log.count > 50) [log setArray:[log subarrayWithRange:NSMakeRange(log.count - 50, 50)]];
-        [[NTM_prefs()] setObject:log forKey:@"NTM_diagLog"];
+        [NTM_prefs() setObject:log forKey:@"NTM_diagLog"];
     } @catch(NSException *e) {}
-}
 }
 
 // 内存缓存：key=NTM_<dim>_<appId> -> NSNumber，通知到达时零 I/O 读取
@@ -656,7 +654,9 @@ static BOOL NTM_isNetAuthPopup(NSString *full) {
 static NSString *NTM_extractNetAuthAppName(NSString *full) {
     if (!full.length) return nil;
     NSRange allow = [full rangeOfString:@"允许"];
-    NSRange wireless = [full rangeOfString:@"使用无线数据"] ?: [full rangeOfString:@"使用蜂窝数据"] ?: [full rangeOfString:@"访问数据"];
+    NSRange wireless = [full rangeOfString:@"使用无线数据"];
+    if (wireless.location == NSNotFound) wireless = [full rangeOfString:@"使用蜂窝数据"];
+    if (wireless.location == NSNotFound) wireless = [full rangeOfString:@"访问数据"];
     if (allow.location == NSNotFound || wireless.location == NSNotFound || wireless.location <= allow.location + allow.length) return nil;
     NSString *mid = [full substringWithRange:NSMakeRange(allow.location + allow.length, wireless.location - allow.location - allow.length)];
     // 尝试多种引号
@@ -700,8 +700,8 @@ static void hook_showAlertCompletion(id self, SEL _cmd, id completion) {
     NSString *bid = nil;
     @try {
         // 有些类有 auditToken 属性
-        void *at = [self valueForKey:@"auditToken"];
-        if (at) bid = NTM_bundleIdFromAuditToken(at);
+        id at = [self valueForKey:@"auditToken"];
+        if (at) bid = NTM_bundleIdFromAuditToken((__bridge void *)at);
     } @catch(NSException *e) {}
     // 回退：从文本解析 App 名
     if (!bid.length) {
@@ -741,9 +741,7 @@ static void hook_presentVC(id self, SEL _cmd, id toPresent, BOOL animated, id co
             for (UIAlertAction *act in ac.actions) {
                 [text appendFormat:@" %s ", act.title.UTF8String ?: ""];
             }
-            for (UIAlertAction *sact in ac.actionSheetCustomActions) {
-                [text appendFormat:@" %s ", sact.title.UTF8String ?: ""];
-            }
+            // actionSheetCustomActions 在 iOS 16 已移除，用 actions 代替
             NSString *full = [text copy];
             if (NTM_isNetAuthPopup(full)) {
                 NTM_diagLog([NSString stringWithFormat:@"presentVC INTERCEPT UIAlertController title=%@", ac.title]);
@@ -1118,18 +1116,16 @@ __attribute__((constructor)) static void init() {
         // iOS 16+ 无线数据权限弹窗走的是 SpringBoard 内部的 _UISystemAlertViewController /
         // SBAuthorizationDialogController，不走通知系统的 dispatchUserNotification。
         // 这些类通过 showWithCompletion: 展示，复用 hook_showAlertCompletion 检测文本。
-        // 如果某些版本这类走 UIAlertController 的 present API，也 hook 一下。
-        // 如果某些版本这类走 UIAlertController 的 present API，也 hook 一下。
-        tryHook(NSClassFromString(@"_UISystemAlertViewController"),
+        tryHook(objc_getClass("_UISystemAlertViewController"),
                 sel_registerName(@"showWithCompletion:"),
                 (IMP)hook_showAlertCompletion, (IMP *)&orig_showAlertCompletion);
-        tryHook(NSClassFromString(@"SBAuthorizationDialogController"),
+        tryHook(objc_getClass("SBAuthorizationDialogController"),
                 sel_registerName(@"showWithCompletion:"),
                 (IMP)hook_showAlertCompletion, (IMP *)&orig_showAlertCompletion);
-        tryHook(NSClassFromString(@"SBAuthorizationDialogViewController"),
+        tryHook(objc_getClass("SBAuthorizationDialogViewController"),
                 sel_registerName(@"showWithCompletion:"),
                 (IMP)hook_showAlertCompletion, (IMP *)&orig_showAlertCompletion);
-        tryHook(NSClassFromString(@"_UIAlertControllerDialogViewController"),
+        tryHook(objc_getClass("_UIAlertControllerDialogViewController"),
                 sel_registerName(@"showWithCompletion:"),
                 (IMP)hook_showAlertCompletion, (IMP *)&orig_showAlertCompletion);
         // 更激进：hook UIViewController 的 presentViewController:animated:completion:
