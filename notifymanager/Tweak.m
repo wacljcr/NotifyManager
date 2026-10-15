@@ -462,7 +462,7 @@ static void hook_showLaunchAlert(id self, SEL _cmd, NSUInteger type, id app) {
 // 断网/后台断网 → 回"不允许"报文; 新安装未配置 App → 回"允许"报文（自动授权）
 // 报文格式：28 字节 = 24 字节头 + 4 字节体；response 0=不允许 1=允许
 static void NTM_sendReply(uint64_t replyPort, uint32_t response) {
-    if (!replyPort) return;
+    if (!replyPort) { NTM_diagLog(@"sendReply SKIP port=0"); return; }
     struct {
         mach_msg_header_t header;
         uint32_t response;
@@ -472,10 +472,17 @@ static void NTM_sendReply(uint64_t replyPort, uint32_t response) {
     msg.header.msgh_remote_port = (mach_port_t)replyPort;
     msg.header.msgh_id = 0;
     msg.response = response; // 0=Default(不允许)  1=Allowed(允许)
+    kern_return_t kr = KERN_SUCCESS;
     @try {
-        mach_msg(&msg.header, MACH_SEND_MSG, (mach_msg_size_t)sizeof(msg),
+        kr = mach_msg(&msg.header, MACH_SEND_MSG, (mach_msg_size_t)sizeof(msg),
                  0, MACH_PORT_NULL, MACH_MSG_TIMEOUT_NONE, MACH_PORT_NULL);
-    } @catch (NSException *e) {}
+    } @catch (NSException *e) {
+        NTM_diagLog([NSString stringWithFormat:@"sendReply EXC %@", e.reason]);
+        return;
+    }
+    // kr==0 表示回包成功送达；非 0 表示失败（端口类型不对/已失效），allow 需靠策略写入兜底
+    NTM_diagLog([NSString stringWithFormat:@"sendReply response=%u kr=%d port=%llu",
+                 response, (int)kr, (unsigned long long)replyPort]);
 }
 static void NTM_sendDenyReply(uint64_t replyPort) { NTM_sendReply(replyPort, 0); }
 static void NTM_sendAllowReply(uint64_t replyPort) { NTM_sendReply(replyPort, 1); }
@@ -561,14 +568,13 @@ static NSString *NTM_bundleIdOfName(NSString *name) {
 // auditToken 是触发弹窗的进程 audit token，包含 PID；通过 proc_pidpath 获取可执行文件路径，
 // 再定位 .app 目录，用 NSBundle 取出 bundle id。若 PID 指向 CommCenter/SpringBoard 等系统进程
 // 则返回 nil，让调用方回退到名字解析。
+// 2.3.34 修正：audit_token_t 布局为 at_auid(0) at_uid(4) at_gid(8) at_pid(12) at_asid(16) ...
+// PID 实际位于第 4 个 uint32_t（offset 12 = t32[3]），旧代码错用 t32[4]（=at_asid 会话ID）导致永远取不到。
 static NSString *NTM_bundleIdFromAuditToken(void *auditToken) {
     if (!auditToken) return nil;
     @try {
-        // audit_token_t 在 iOS 上字段名与 macOS 不同，用偏移量直接读取。
-        // 结构布局: uid(4)+gid(4)+ruid(4)+rgid(4)+pid(4)+ppid(4)+...
-        // PID 位于第 4 个 uint32_t（offset 16）
         uint32_t *t32 = (uint32_t *)auditToken;
-        pid_t pid = (pid_t)t32[4];
+        pid_t pid = (pid_t)t32[3]; // at_pid
         if (pid <= 0) return nil;
         char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
         if (proc_pidpath(pid, path, sizeof(path)) <= 0) return nil;
@@ -578,10 +584,17 @@ static NSString *NTM_bundleIdFromAuditToken(void *auditToken) {
         if ([exePath containsString:@"CommCenter"] ||
             [exePath containsString:@"SpringBoard"] ||
             [exePath hasPrefix:@"/usr/libexec/"] ||
-            [exePath hasPrefix:@"/usr/sbin/"]) return nil;
-        NSURL *exeURL = [NSURL fileURLWithPath:exePath];
-        NSURL *appURL = [exeURL URLByDeletingLastPathComponent];
-        if (![appURL.path hasSuffix:@".app"]) return nil;
+            [exePath hasPrefix:@"/usr/sbin/"] ||
+            [exePath hasPrefix:@"/System/"]) return nil;
+        // 沿路径向上找 .app 目录（主程序通常直接位于 .app 内，但部分 App 可执行文件在子目录）
+        NSURL *appURL = [NSURL fileURLWithPath:exePath];
+        for (int i = 0; i < 8; i++) {
+            if ([[appURL.path pathExtension] isEqualToString:@"app"]) break;
+            NSURL *parent = [appURL URLByDeletingLastPathComponent];
+            if (!parent || [parent.path isEqualToString:appURL.path]) { appURL = nil; break; }
+            appURL = parent;
+        }
+        if (!appURL) return nil;
         NSBundle *b = [NSBundle bundleWithURL:appURL];
         NSString *bid = b.bundleIdentifier;
         return bid.length ? bid : nil;
@@ -640,11 +653,16 @@ static void hook_dispatch(id self, SEL _cmd, id msg, uint64_t flags,
         // 网络授权弹窗：白名单式放行，永远不要让系统把选择框弹出来
         NTM_diagLog([NSString stringWithFormat:@"dispatch NETALERT src=%@ text=%@",
                      [msg objectForKey:@"AlertSource"], fullText]);
-        // 解析目标 App 的 bundle id（多路兜底，越靠后越兜底）
-        NSString *bid = NTM_bundleIdFromAuditToken(auditToken);           // 1) auditToken（最可靠）
-        if (!bid.length) bid = NTM_bundleIdOfName([msg objectForKey:@"AlertHeader"]); // 2) AlertHeader 即 App 原名
-        if (!bid.length) bid = NTM_bundleIdOfName(NTM_extractNetAuthAppName(fullText)); // 3) 从「允许X使用无线数据」提取
-        if (!bid.length) bid = NTM_frontmostBundleId();                   // 4) 前台 App 即发起网络请求的 App
+        // 解析目标 App 的 bundle id（多路兜底，按可靠度排序）
+        // 2.3.34：修正 auditToken PID 偏移后它最可靠；前台 App 次之（网络请求由前台 App 发起）；
+        // 文本提取最后兜底。每步记录命中哪一路，便于诊断。
+        NSString *bid = nil; NSString *via = nil;
+        NSString *aBid = NTM_bundleIdFromAuditToken(auditToken);
+        if (aBid.length) { bid = aBid; via = @"auditToken"; }
+        if (!bid.length) { NSString *f = NTM_frontmostBundleId(); if (f.length) { bid = f; via = @"frontmost"; } }
+        if (!bid.length) { NSString *en = NTM_extractNetAuthAppName(fullText); if (en.length) { NSString *b = NTM_bundleIdOfName(en); if (b.length) { bid = b; via = @"nameExtract"; } } }
+        if (!bid.length) { NSString *h = NTM_extractNetAuthAppName([msg objectForKey:@"AlertHeader"] ?: @""); if (h.length) { NSString *b = NTM_bundleIdOfName(h); if (b.length) { bid = b; via = @"headerName"; } } }
+        NTM_diagLog([NSString stringWithFormat:@"dispatch RESOLVE via=%@ bid=%@", via ?: @"NONE", bid ?: @"(null)"]);
         NSInteger net = bid.length ? NTM_netRead(bid) : 0;
         BOOL bgNet = bid.length ? NTM_bgNetOn(bid) : NO;
         if (net == 1 || bgNet) {
@@ -653,12 +671,16 @@ static void hook_dispatch(id self, SEL _cmd, id msg, uint64_t flags,
             NTM_sendDenyReply(replyPort);
             return;
         }
-        // 非断网：新安装 App 写 allow 策略；已配置 App 直接放行；一律回 allow 报文，不让弹窗出现
-        if (bid.length && !NTM_isAppConfigured(bid)) {
+        // 非断网：无论是否「已配置」，都无条件写 allow 策略（wifi+流量允许），并回 allow 报文，
+        // 让该 App 真正获得「无线局域网与蜂窝网络」权限（面板 allow 走的就是同一套写入）。
+        // bid 为空时无法写策略，只尽力回 allow 报文（回包若损坏则靠下次请求重试）。
+        if (bid.length) {
             NTM_syncCellularSB(bid, 0); // 写系统蜂窝策略（wifi+流量允许）
-            NTM_diagLog([NSString stringWithFormat:@"dispatch ALLOW+write bid=%@", bid]);
+            NTM_diagLog([NSString stringWithFormat:@"dispatch ALLOW+write bid=%@ port=%llu",
+                         bid, (unsigned long long)replyPort]);
         } else {
-            NTM_diagLog([NSString stringWithFormat:@"dispatch ALLOW bid=%@", bid]);
+            NTM_diagLog([NSString stringWithFormat:@"dispatch ALLOW(no-bid) port=%llu",
+                         (unsigned long long)replyPort]);
         }
         NTM_sendAllowReply(replyPort);
         return;
@@ -716,23 +738,23 @@ static NSString *NTM_extractNetAuthAppName(NSString *full) {
 // 的 bundle id（网络授权弹窗由前台 App 触发，前台 App 即目标 App）。
 
 // SpringBoard 前台 App 的 bundle id
+// 2.3.34：扩充类与选择器兜底，优先 SBMainWorkspace（iOS 13+ 主工作区），其次 SBWorkspace / SBApplicationController
 static NSString *NTM_frontmostBundleId(void) {
     if (!NTM_isSpringBoard()) return nil;
     @try {
-        id ctrl = nil;
-        Class ctrlCls = NSClassFromString(@"SBApplicationController");
-        if (ctrlCls && [ctrlCls respondsToSelector:NSSelectorFromString(@"sharedInstance")])
-            ctrl = ((id (*)(id, SEL))objc_msgSend)(ctrlCls, NSSelectorFromString(@"sharedInstance"));
-        if (!ctrl) {
-            Class wsCls = NSClassFromString(@"SBWorkspace");
-            if (wsCls && [wsCls respondsToSelector:NSSelectorFromString(@"sharedInstance")])
-                ctrl = ((id (*)(id, SEL))objc_msgSend)(wsCls, NSSelectorFromString(@"sharedInstance"));
-        }
-        if (!ctrl) return nil;
-        NSArray *sels = @[@"frontmostApplication", @"currentActiveApplication"];
-        for (NSString *sn in sels) {
-            SEL s = NSSelectorFromString(sn);
-            if ([ctrl respondsToSelector:s]) {
+        NSArray *ctrls = @[NSClassFromString(@"SBMainWorkspace"),
+                           NSClassFromString(@"SBWorkspace"),
+                           NSClassFromString(@"SBApplicationController")];
+        NSArray *sels = @[@"frontmostApplication", @"currentActiveApplication", @"activeApplication"];
+        for (id ctrlCls in ctrls) {
+            if (!ctrlCls) continue;
+            SEL sInst = NSSelectorFromString(@"sharedInstance");
+            if (![ctrlCls respondsToSelector:sInst]) continue;
+            id ctrl = ((id (*)(id, SEL))objc_msgSend)(ctrlCls, sInst);
+            if (!ctrl) continue;
+            for (NSString *sn in sels) {
+                SEL s = NSSelectorFromString(sn);
+                if (![ctrl respondsToSelector:s]) continue;
                 id app = ((id (*)(id, SEL))objc_msgSend)(ctrl, s);
                 if (app && [app respondsToSelector:@selector(bundleIdentifier)]) {
                     NSString *bid = [app bundleIdentifier];
@@ -1268,7 +1290,7 @@ __attribute__((constructor)) static void init() {
         // 诊断日志：记录 init 完成 + 关键 hook 是否装上（dispatch 是网络弹窗的唯一可靠处理点）
         if (NTM_isSpringBoard()) {
             NTM_diagLog([NSString stringWithFormat:
-                @"init DONE v2.3.33 hooks: dispatch=%d presentAlertItem=%d presentVC=%d",
+                @"init DONE v2.3.34 hooks: dispatch=%d presentAlertItem=%d presentVC=%d",
                 (orig_dispatch != NULL), (orig_presentAlertItem != NULL), (orig_presentVC != NULL)]);
         }
     }
