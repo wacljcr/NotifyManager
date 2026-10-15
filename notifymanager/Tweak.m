@@ -17,9 +17,8 @@
 #import <objc/message.h>
 #import <dlfcn.h>
 #import <mach/mach.h>
-#include <sys/proc_info.h>
-// libproc.h 是 macOS 专用头文件，iOS SDK 未提供；
-// proc_pidpath 在 iOS 上作为私有 API 可用，手动声明避免依赖头文件。
+// libproc.h 和 sys/proc_info.h 均仅存在于 macOS，iOS SDK 不提供。
+// proc_pidpath 在 iOS 上作为私有 API 可用，手动声明即可。
 #ifndef PROC_PIDPATHINFO_MAXSIZE
 #define PROC_PIDPATHINFO_MAXSIZE 4096
 #endif
