@@ -15,7 +15,6 @@ jobs:
     steps:
       - name: Setup
         run: |
-          echo "Workflow: ${GITHUB_WORKFLOW}"
           echo "Run ID: ${{ github.event.workflow_run.id }}"
           echo "Event name: ${{ github.event.workflow_run.name }}"
 
@@ -39,8 +38,13 @@ jobs:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           set -e
+
           # Clone the repo
-          git clone https://${GH_TOKEN}@github.com/wacljcr/mumu.git repo
+          echo "Cloning wacljcr/mumu..."
+          git clone "https://${GH_TOKEN}@github.com/wacljcr/mumu.git" repo 2>&1 || {
+            echo "Clone failed, trying without token..."
+            git clone https://github.com/wacljcr/mumu.git repo 2>&1 || exit 1
+          }
           cd repo
 
           # Create directories
@@ -97,4 +101,8 @@ jobs:
           git config user.email "github-actions[bot]@users.noreply.github.com"
           git add -A
           git diff --staged --quiet || git commit -m "Auto-update: $(date +'%Y-%m-%d %H:%M')"
-          git push
+          git push 2>&1 || {
+            echo "Push failed with GH_TOKEN, trying with GITHUB_TOKEN..."
+            git remote set-url origin "https://${{ github.token }}@github.com/wacljcr/mumu.git"
+            git push
+          }
