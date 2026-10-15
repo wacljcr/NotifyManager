@@ -33,26 +33,64 @@ jobs:
           name: NotifyManager-deb
           path: ./debs/
 
-      - name: Regenerate Packages and push
+      - name: Push to mumu repo via API
         env:
           GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           set -e
 
-          # Clone the repo
-          echo "Cloning wacljcr/mumu..."
-          git clone "https://${GH_TOKEN}@github.com/wacljcr/mumu.git" repo 2>&1 || {
-            echo "Clone failed, trying without token..."
-            git clone https://github.com/wacljcr/mumu.git repo 2>&1 || exit 1
-          }
-          cd repo
+          REPO="wacljcr/mumu"
+          BRANCH="main"
 
-          # Create directories
-          mkdir -p debian/dists/stable/main/binary-all
+          # Function to push a file via GitHub Contents API
+          push_file() {
+            local path="$1"
+            local content_file="$2"
+
+            # Check if file exists to get its SHA
+            local sha=""
+            local resp
+            resp=$(curl -s -H "Authorization: token ${GH_TOKEN}" \
+              "https://api.github.com/repos/${REPO}/contents/${path}?ref=${BRANCH}")
+
+            if echo "$resp" | grep -q '"sha"'; then
+              sha=$(echo "$resp" | python3 -c "import sys,json; print(json.load(sys.stdin).get('sha',''))" 2>/dev/null || echo "")
+            fi
+
+            # Base64 encode content
+            local b64
+            b64=$(base64 -w0 "$content_file")
+
+            # Build payload
+            local payload
+            if [ -n "$sha" ]; then
+              payload=$(cat << EOM
+          {"message":"Auto-update ${path}","content":"${b64}","sha":"${sha}"}
+          EOM
+            )
+            else
+              payload=$(cat << EOM
+          {"message":"Auto-update ${path}","content":"${b64}"}
+          EOM
+            )
+            fi
+
+            # Push via API
+            curl -s -X PUT \
+              -H "Authorization: token ${GH_TOKEN}" \
+              -H "Content-Type: application/json" \
+              -d "$payload" \
+              "https://api.github.com/repos/${REPO}/contents/${path}" > /dev/null
+
+            echo "Pushed: ${path}"
+          }
+
+          # Create repo structure locally for generation
           mkdir -p debian/pool/main
+          mkdir -p debian/dists/stable/main/binary-all
 
           # Copy debs to pool
-          cp ../../debs/*.deb debian/pool/main/ 2>/dev/null || true
+          cp debs/*.deb debian/pool/main/ 2>/dev/null || true
 
           # Generate Packages file
           cd debian/pool/main
@@ -73,7 +111,7 @@ jobs:
           bzip2 -k debian/dists/stable/main/binary-all/Packages
           cp debian/dists/stable/main/binary-all/Packages.bz2 debian/dists/stable/main/binary-all/
 
-          # Update Release file
+          # Create Release file
           cat > Release << EOF
           Origin: NTM Jailbreak Repo
           Label: NTM Repo
@@ -96,13 +134,17 @@ jobs:
           echo " $(sha256sum debian/dists/stable/main/binary-all/Packages | cut -d' ' -f1) $(stat -c%s debian/dists/stable/main/binary-all/Packages) debian/dists/stable/main/binary-all/Packages" >> Release
           echo " $(sha256sum debian/dists/stable/main/binary-all/Packages.bz2 | cut -d' ' -f1) $(stat -c%s debian/dists/stable/main/binary-all/Packages.bz2) debian/dists/stable/main/binary-all/Packages.bz2" >> Release
 
-          # Commit and push
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git add -A
-          git diff --staged --quiet || git commit -m "Auto-update: $(date +'%Y-%m-%d %H:%M')"
-          git push 2>&1 || {
-            echo "Push failed with GH_TOKEN, trying with GITHUB_TOKEN..."
-            git remote set-url origin "https://${{ github.token }}@github.com/wacljcr/mumu.git"
-            git push
-          }
+          echo "=== Files ready ==="
+          ls -la debian/pool/main/
+          ls -la debian/dists/stable/main/binary-all/
+
+          # Push all files
+          for deb in debian/pool/main/*.deb; do
+            [ -f "$deb" ] || continue
+            push_file "debian/pool/main/$(basename $deb)" "$deb"
+          done
+          push_file "debian/dists/stable/main/binary-all/Packages" "debian/dists/stable/main/binary-all/Packages"
+          push_file "debian/dists/stable/main/binary-all/Packages.bz2" "debian/dists/stable/main/binary-all/Packages.bz2"
+          push_file "Release" "Release"
+
+          echo "Done!"
