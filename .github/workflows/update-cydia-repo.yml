@@ -51,9 +51,8 @@ jobs:
           done
           cd ../../..
 
-          # Create Packages.bz2
+          # Create Packages.bz2 (bzip2 -k already creates in same dir)
           bzip2 -k debian/dists/stable/main/binary-all/Packages
-          cp debian/dists/stable/main/binary-all/Packages.bz2 debian/dists/stable/main/binary-all/
 
           # Create Release file
           {
