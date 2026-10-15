@@ -12,18 +12,6 @@ jobs:
     runs-on: ubuntu-latest
     if: ${{ github.event.workflow_run.conclusion == 'success' }}
     steps:
-      - name: Setup
-        run: |
-          echo "Run ID: ${{ github.event.workflow_run.id }}"
-          echo "Event name: ${{ github.event.workflow_run.name }}"
-          echo "GH_TOKEN: ***"
-
-      - name: Test GH_TOKEN access to mumu
-        run: |
-          echo "Testing GH_TOKEN access to wacljcr/mumu..."
-          curl -s -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
-            "https://api.github.com/repos/wacljcr/mumu" | python3 -c "import sys,json; d=json.load(sys.stdin); print('Name:', d.get('full_name')); print('Permissions:', d.get('permissions'))"
-
       - name: Download NotifyManager deb artifact
         uses: actions/download-artifact@v4
         with:
@@ -32,58 +20,95 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GH_TOKEN }}
 
-      - name: Push to mumu repo via API
+      - name: Generate Packages and push to mumu
+        env:
+          GH_TOKEN: ${{ secrets.GH_TOKEN }}
         run: |
           set -e
-          set -x
+          # Write the push script
+          cat > /tmp/push_repo.py << 'PYEOF'
+          import base64, json, os, sys, urllib.request, urllib.error
 
-          REPO="wacljcr/mumu"
-          BRANCH="main"
-          TOKEN="${{ secrets.GH_TOKEN }}"
+          REPO = "wacljcr/mumu"
+          BRANCH = "main"
+          TOKEN = os.environ["GH_TOKEN"]
 
-          # Function to push a file via GitHub Contents API (using Python for JSON)
-          push_file() {
-            local path="$1"
-            local content_file="$2"
+          def push_file(path, content_file):
+              url = f"https://api.github.com/repos/{REPO}/contents/{path}?ref={BRANCH}"
+              headers = {
+                  "Authorization": f"token {TOKEN}",
+                  "Accept": "application/vnd.github+json",
+                  "Content-Type": "application/json"
+              }
 
-            python3 -c "
-          import requests, base64, json, sys
+              # Read and base64 encode
+              with open(content_file, "rb") as f:
+                  b64 = base64.b64encode(f.read()).decode()
 
-          path = sys.argv[1]
-          content_file = sys.argv[2]
-          repo = 'wacljcr/mumu'
-          branch = 'main'
-          token = sys.argv[3]
+              # Check if file exists (get SHA)
+              sha = None
+              try:
+                  req = urllib.request.Request(url, headers=headers)
+                  with urllib.request.urlopen(req) as resp:
+                      data = json.loads(resp.read())
+                      sha = data.get("sha")
+              except urllib.error.HTTPError as e:
+                  if e.code != 404:
+                      print(f"Error checking {path}: {e.code}")
+                      pass
 
-          with open(content_file, 'rb') as f:
-              b64 = base64.b64encode(f.read()).decode()
+              # Build payload
+              payload = {"message": f"Auto-update {path}", "content": b64}
+              if sha:
+                  payload["sha"] = sha
 
-          url = f'https://api.github.com/repos/{repo}/contents/{path}?ref={branch}'
-          headers = {'Authorization': f'token {token}', 'Accept': 'application/vnd.github+json', 'Content-Type': 'application/json'}
+              # Push via API
+              put_url = f"https://api.github.com/repos/{REPO}/contents/{path}"
+              data = json.dumps(payload).encode()
+              req = urllib.request.Request(put_url, data=data, headers=headers, method="PUT")
+              try:
+                  with urllib.request.urlopen(req) as resp:
+                      print(f"Pushed: {path} (HTTP {resp.status})")
+              except urllib.error.HTTPError as e:
+                  body = e.read().decode()[:500]
+                  print(f"FAILED: {path} (HTTP {e.code}): {body}")
+                  sys.exit(1)
 
-          # Check if file exists
-          sha = None
-          r = requests.get(url, headers=headers)
-          if r.status_code == 200:
-              sha = r.json().get('sha')
+          # Find all files to push
+          files_to_push = []
 
-          payload = {'message': f'Auto-update {path}', 'content': b64}
-          if sha:
-              payload['sha'] = sha
+          # Deb files
+          deb_dir = "debian/pool/main"
+          if os.path.isdir(deb_dir):
+              for f in os.listdir(deb_dir):
+                  if f.endswith(".deb"):
+                      files_to_push.append((f"debian/pool/main/{f}", os.path.join(deb_dir, f)))
 
-          r = requests.put(f'https://api.github.com/repos/{repo}/contents/{path}', headers=headers, data=json.dumps(payload))
-          print(f'{path}: HTTP {r.status_code}')
-          if r.status_code not in (200, 201):
-              print(r.text[:500])
-              sys.exit(1)
-          " "$path" "$content_file" "$TOKEN"
-          }
+          # Packages and Packages.bz2
+          for fname in ["Packages", "Packages.bz2"]:
+              fpath = f"debian/dists/stable/main/binary-all/{fname}"
+              if os.path.exists(fpath):
+                  files_to_push.append((fpath, fpath))
 
-          # Create repo structure locally for generation
+          # Release
+          if os.path.exists("Release"):
+              files_to_push.append(("Release", "Release"))
+
+          print(f"Files to push: {len(files_to_push)}")
+          for path, _ in files_to_push:
+              print(f"  - {path}")
+
+          for path, fpath in files_to_push:
+              push_file(path, fpath)
+
+          print("All done!")
+          PYEOF
+
+          # Create repo structure
           mkdir -p debian/pool/main
           mkdir -p debian/dists/stable/main/binary-all
 
-          # Copy debs to pool
+          # Copy debs
           cp debs/*.deb debian/pool/main/ 2>/dev/null || true
 
           # Generate Packages file
@@ -132,13 +157,5 @@ jobs:
           ls -la debian/pool/main/
           ls -la debian/dists/stable/main/binary-all/
 
-          # Push all files
-          for deb in debian/pool/main/*.deb; do
-            [ -f "$deb" ] || continue
-            push_file "debian/pool/main/$(basename $deb)" "$deb"
-          done
-          push_file "debian/dists/stable/main/binary-all/Packages" "debian/dists/stable/main/binary-all/Packages"
-          push_file "debian/dists/stable/main/binary-all/Packages.bz2" "debian/dists/stable/main/binary-all/Packages.bz2"
-          push_file "Release" "Release"
-
-          echo "Done!"
+          # Run the push script
+          python3 /tmp/push_repo.py
