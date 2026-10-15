@@ -527,7 +527,7 @@ static NSString *NTM_bundleIdFromAuditToken(void *auditToken) {
     if (!auditToken) return nil;
     @try {
         audit_token_t *tok = (audit_token_t *)auditToken;
-        pid_t pid = tok->at_pid;
+        pid_t pid = tok->a_pid;
         if (pid <= 0) return nil;
         char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
         if (proc_pidpath(pid, path, sizeof(path)) <= 0) return nil;
@@ -565,6 +565,9 @@ static int NTM_checkWirelessAlert(id msg) {
         return -1;                              // 面板已配置 → 原始逻辑
     } @catch (NSException *e) { return -1; }
 }
+
+// NTM_syncCellularSB 定义在文件后部，此处前向声明
+static void NTM_syncCellularSB(NSString *bid, NSInteger policy);
 
 static void (*orig_dispatch)(id, SEL, id, uint64_t, uint64_t, void *);
 static void hook_dispatch(id self, SEL _cmd, id msg, uint64_t flags,
