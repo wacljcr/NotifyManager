@@ -15,6 +15,11 @@ jobs:
       - name: Checkout scripts
         uses: actions/checkout@v4
 
+      - name: Clone mumu repo
+        run: |
+          git clone --depth 1 "https://x-access-token:${{ secrets.GH_TOKEN }}@github.com/wacljcr/mumu.git" mumu
+          ls -la mumu/
+
       - name: Download NotifyManager deb artifact
         uses: actions/download-artifact@v4
         with:
@@ -23,63 +28,29 @@ jobs:
           run-id: ${{ github.event.workflow_run.id }}
           github-token: ${{ secrets.GH_TOKEN }}
 
-      - name: Generate Packages and push to mumu
-        env:
-          GH_TOKEN: ${{ secrets.GH_TOKEN }}
+      - name: Place deb and regenerate index
         run: |
           set -e
+          # 放进源的 debs/ 目录（覆盖旧版本）
+          cp debs/*.deb mumu/debs/
+          echo "=== debs/ ==="
+          ls -la mumu/debs/ | grep -i notify
 
-          # Create repo structure
-          mkdir -p debian/pool/main
-          mkdir -p debian/dists/stable/main/binary-all
+          # 用源自带的 gen_packages.py 生成索引
+          cd mumu
+          python3 gen_packages.py
+          echo "=== index files ==="
+          ls -la Packages Packages.bz2 Release 2>/dev/null || true
 
-          # Copy debs
-          cp debs/*.deb debian/pool/main/ 2>/dev/null || true
+          # 验证版本号已写入
+          grep -A2 "Package: com.ntm.notifymanager" Packages | head -6
 
-          # Generate Packages file
-          cd debian/pool/main
-          > ../../dists/stable/main/binary-all/Packages
-          for deb in *.deb; do
-            [ -f "$deb" ] || continue
-            dpkg-deb -f "$deb" >> ../../dists/stable/main/binary-all/Packages
-            echo "Filename: ./debian/pool/main/$deb" >> ../../dists/stable/main/binary-all/Packages
-            echo "Size: $(stat -c%s "$deb")" >> ../../dists/stable/main/binary-all/Packages
-            echo "MD5sum: $(md5sum "$deb" | cut -d' ' -f1)" >> ../../dists/stable/main/binary-all/Packages
-            echo "SHA1: $(sha1sum "$deb" | cut -d' ' -f1)" >> ../../dists/stable/main/binary-all/Packages
-            echo "SHA256: $(sha256sum "$deb" | cut -d' ' -f1)" >> ../../dists/stable/main/binary-all/Packages
-            echo "" >> ../../dists/stable/main/binary-all/Packages
-          done
-          cd ../../..
-
-          # Create Packages.bz2 (bzip2 -k already creates in same dir)
-          bzip2 -k debian/dists/stable/main/binary-all/Packages
-
-          # Create Release file
-          {
-            echo "Origin: NTM Jailbreak Repo"
-            echo "Label: NTM Repo"
-            echo "Suite: stable"
-            echo "Version: 1.0"
-            echo "Codename: ios"
-            echo "Architectures: iphoneos-arm64"
-            echo "Components: main"
-            echo "Description: NTM Jailbreak Repo"
-            echo "Support: https://github.com/wacljcr/mumu"
-            echo "Date: $(date -R)"
-            echo "MD5Sum:"
-            echo " $(md5sum debian/dists/stable/main/binary-all/Packages | cut -d' ' -f1) $(stat -c%s debian/dists/stable/main/binary-all/Packages) debian/dists/stable/main/binary-all/Packages"
-            echo " $(md5sum debian/dists/stable/main/binary-all/Packages.bz2 | cut -d' ' -f1) $(stat -c%s debian/dists/stable/main/binary-all/Packages.bz2) debian/dists/stable/main/binary-all/Packages.bz2"
-            echo "SHA1:"
-            echo " $(sha1sum debian/dists/stable/main/binary-all/Packages | cut -d' ' -f1) $(stat -c%s debian/dists/stable/main/binary-all/Packages) debian/dists/stable/main/binary-all/Packages"
-            echo " $(sha1sum debian/dists/stable/main/binary-all/Packages.bz2 | cut -d' ' -f1) $(stat -c%s debian/dists/stable/main/binary-all/Packages.bz2) debian/dists/stable/main/binary-all/Packages.bz2"
-            echo "SHA256:"
-            echo " $(sha256sum debian/dists/stable/main/binary-all/Packages | cut -d' ' -f1) $(stat -c%s debian/dists/stable/main/binary-all/Packages) debian/dists/stable/main/binary-all/Packages"
-            echo " $(sha256sum debian/dists/stable/main/binary-all/Packages.bz2 | cut -d' ' -f1) $(stat -c%s debian/dists/stable/main/binary-all/Packages.bz2) debian/dists/stable/main/binary-all/Packages.bz2"
-          } > Release
-
-          echo "=== Files ready ==="
-          ls -la debian/pool/main/
-          ls -la debian/dists/stable/main/binary-all/
-
-          # Push via Python script
-          python3 .github/scripts/push_repo.py
+      - name: Commit and push
+        run: |
+          set -e
+          cd mumu
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          git diff --staged --quiet && echo "No changes" || git commit -m "Auto-build NotifyManager: $(date +'%Y-%m-%d %H:%M')"
+          git push
