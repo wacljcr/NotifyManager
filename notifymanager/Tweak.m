@@ -526,8 +526,11 @@ static NSString *NTM_bundleIdOfName(NSString *name) {
 static NSString *NTM_bundleIdFromAuditToken(void *auditToken) {
     if (!auditToken) return nil;
     @try {
-        audit_token_t *tok = (audit_token_t *)auditToken;
-        pid_t pid = tok->a_pid;
+        // audit_token_t 在 iOS 上字段名与 macOS 不同，用偏移量直接读取。
+        // 结构布局: uid(4)+gid(4)+ruid(4)+rgid(4)+pid(4)+ppid(4)+...
+        // PID 位于第 4 个 uint32_t（offset 16）
+        uint32_t *t32 = (uint32_t *)auditToken;
+        pid_t pid = (pid_t)t32[4];
         if (pid <= 0) return nil;
         char path[PROC_PIDPATHINFO_MAXSIZE] = {0};
         if (proc_pidpath(pid, path, sizeof(path)) <= 0) return nil;
