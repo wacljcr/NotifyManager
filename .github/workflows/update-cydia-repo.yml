@@ -30,6 +30,7 @@ jobs:
           name: NotifyManager-deb
           path: ./debs/
           run-id: ${{ github.event.workflow_run.id }}
+          github-token: ${{ secrets.GH_TOKEN }}
 
       - name: Push to mumu repo via API
         run: |
