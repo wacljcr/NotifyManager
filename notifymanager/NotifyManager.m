@@ -432,7 +432,14 @@ static NSArray *NTM_allApps(void) {
             if (![path hasPrefix:@"/Applications/"]) continue;
             if (!NTM_hasNotifications(bid)) continue;
         }
-        [out addObject:@{ @"id":bid, @"name":(name.length?name:bid), @"cat":cat, @"icon":[NSNull null] }];
+        // 获取安装时间（用于"最近"过滤）
+        NSDate *installDate = nil;
+        NSError *err = nil;
+        NSDictionary *attrs = [[NSFileManager defaultManager] attributesOfItemAtPath:path error:&err];
+        if (attrs) {
+            installDate = [attrs objectForKey:NSFileCreationDate] ?: [attrs objectForKey:NSFileModificationDate];
+        }
+        [out addObject:@{ @"id":bid, @"name":(name.length?name:bid), @"cat":cat, @"icon":[NSNull null], @"path":path, @"installDate":installDate ? installDate : [NSDate distantPast] }];
     }
     NSMutableSet *seen = [NSMutableSet set];
     for (NSDictionary *app in out) [seen addObject:app[@"id"]];
@@ -442,7 +449,7 @@ static NSArray *NTM_allApps(void) {
         if (![installed containsObject:sid]) continue;
         if (![sid hasPrefix:@"com.apple."]) continue;
         [seen addObject:sid];
-        [out addObject:@{@"id":sid, @"name":sec[@"name"], @"cat":@"系统应用", @"icon":[NSNull null]}];
+        [out addObject:@{@"id":sid, @"name":sec[@"name"], @"cat":@"系统应用", @"icon":[NSNull null], @"path":@"/Applications", @"installDate":[NSDate distantPast]}];
     }
     NSArray *order = @[@"用户应用", @"巨魔应用", @"系统应用"];
     [out sortUsingComparator:^NSComparisonResult(NSDictionary *a, NSDictionary *b){
@@ -868,6 +875,8 @@ static UIButton *NTM_actionTag(NSString *text, UIColor *color) {
     UIStackView *_topRow;   // 顶部一行：全部开启/关闭/自定义/模式快照/应用分组
     UIButton *_multiAllBtn;
     UIButton *_selEntryBtn; // 分类栏右侧"全选"入口
+    UIButton *_recentBtn;   // 分类栏右侧"最近"入口
+    BOOL _showRecent;       // 是否只显示最近安装的 App
     UIStackView *_headCol;  // 顶部行 + 多选批量栏 的纵向容器
     UIStackView *_editCol;  // 多选批量操作三行容器
     UIStackView *_editRow1; // 取消/全选/通知/声音
@@ -947,6 +956,12 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
         [UIColor colorWithRed:0.16 green:0.38 blue:0.78 alpha:1]);
     _selEntryBtn.titleLabel.font = [UIFont systemFontOfSize:14];
     [_selEntryBtn addTarget:self action:@selector(selEntryTapped) forControlEvents:UIControlEventTouchUpInside];
+
+    _recentBtn = NTM_pillButton(@"最近",
+        [UIColor colorWithRed:0.98 green:0.82 blue:0.45 alpha:0.20],
+        [UIColor colorWithRed:0.78 green:0.55 blue:0.16 alpha:1]);
+    _recentBtn.titleLabel.font = [UIFont systemFontOfSize:14];
+    [_recentBtn addTarget:self action:@selector(recentTapped) forControlEvents:UIControlEventTouchUpInside];
 
     _filterSeg = [[UISegmentedControl alloc] initWithItems:@[@"全部", @"已开启", @"已关闭", @"断网"]];
     _filterSeg.selectedSegmentIndex = 0;
@@ -1131,7 +1146,7 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     _headCol.axis = UILayoutConstraintAxisVertical;
     _headCol.spacing = 6;
 
-    for (UIView *v in @[_tableView, _headCol, _statLabel, _searchBar, _filterSeg, _catSeg, _selEntryBtn, exportBtn, importBtn]) {
+    for (UIView *v in @[_tableView, _headCol, _statLabel, _searchBar, _filterSeg, _catSeg, _recentBtn, _selEntryBtn, exportBtn, importBtn]) {
         v.translatesAutoresizingMaskIntoConstraints = NO;
         [self.view addSubview:v];
     }
@@ -1163,7 +1178,12 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
 
         [_catSeg.topAnchor constraintEqualToAnchor:_filterSeg.bottomAnchor constant:6],
         [_catSeg.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
-        [_catSeg.trailingAnchor constraintEqualToAnchor:_selEntryBtn.leadingAnchor constant:-8],
+        [_catSeg.trailingAnchor constraintEqualToAnchor:_recentBtn.leadingAnchor constant:-8],
+
+        [_recentBtn.centerYAnchor constraintEqualToAnchor:_catSeg.centerYAnchor],
+        [_recentBtn.trailingAnchor constraintEqualToAnchor:_selEntryBtn.leadingAnchor constant:-8],
+        [_recentBtn.widthAnchor constraintEqualToConstant:64],
+        [_recentBtn.heightAnchor constraintEqualToConstant:34],
 
         [_selEntryBtn.centerYAnchor constraintEqualToAnchor:_catSeg.centerYAnchor],
         [_selEntryBtn.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
@@ -1244,6 +1264,20 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     [self updateMultiUIBar];
     [self updateSelAllTitle];
     [_tableView reloadData];
+}
+
+- (void)recentTapped {
+    // 切换"最近"模式：只显示最近 7 天内安装的 App
+    _showRecent = !_showRecent;
+    if (_showRecent) {
+        // 高亮按钮，表示正在过滤
+        _recentBtn.backgroundColor = [UIColor colorWithRed:0.98 green:0.82 blue:0.45 alpha:1];
+        [_recentBtn setTitleColor:[UIColor whiteColor] forState:UIControlStateNormal];
+    } else {
+        _recentBtn.backgroundColor = [UIColor colorWithRed:0.98 green:0.82 blue:0.45 alpha:0.20];
+        [_recentBtn setTitleColor:[UIColor colorWithRed:0.78 green:0.55 blue:0.16 alpha:1] forState:UIControlStateNormal];
+    }
+    [self reloadList];
 }
 - (void)updateMultiUIBar {
     // UIStackView 对 arranged 子视图设置 hidden 会自动折叠/展开，无需手调高度
@@ -1468,6 +1502,8 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
 #pragma mark - 列表
 - (void)reloadList {
     NSMutableArray *filtered = [NSMutableArray array];
+    // "最近"模式：只显示最近 7 天内安装的 App
+    NSDate *recentThreshold = [NSDate dateWithTimeIntervalSinceNow:-7*24*60*60];
     for (NSDictionary *app in _allApps) {
         if (_searchText.length) {
             NSString *name = app[@"name"];
@@ -1476,6 +1512,10 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
                 ![bid localizedCaseInsensitiveContainsString:_searchText]) continue;
         } else {
             if (![app[@"cat"] isEqualToString:_curCat]) continue;
+        }
+        if (_showRecent) {
+            NSDate *installDate = app[@"installDate"];
+            if (!installDate || [installDate compare:recentThreshold] == NSOrderedAscending) continue;
         }
         if (_filter == 1) { if (!NTM_read(app[@"id"], @"en")) continue; }
         else if (_filter == 2) { if (NTM_read(app[@"id"], @"en")) continue; }
@@ -1486,7 +1526,7 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
 
     if (!filtered.count) {
         UILabel *empty = [[UILabel alloc] initWithFrame:CGRectMake(0, 0, 260, 80)];
-        empty.text = @"暂无应用";
+        empty.text = _showRecent ? @"最近 7 天无新安装 App" : @"暂无应用";
         empty.font = [UIFont systemFontOfSize:14];
         empty.textColor = [UIColor colorWithWhite:0.55 alpha:1];
         empty.textAlignment = NSTextAlignmentCenter;
@@ -1518,6 +1558,7 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     NSString *scope = _searchText.length ? [NSString stringWithFormat:@"搜索：%@", _searchText]
                      : (_filter ? [NSString stringWithFormat:@"%@ / %@", _curCat, @[@"", @"已开启", @"已关闭", @"断网"][_filter]]
                                 : _curCat);
+    if (_showRecent) scope = [NSString stringWithFormat:@"%@ / 最近7天", scope];
     _statLabel.text = [NSString stringWithFormat:@"%@    已开启 %ld / %ld 个应用", scope, (long)on, (long)total];
 }
 
