@@ -4,7 +4,6 @@ on:
   workflow_run:
     workflows:
       - "build-notify"
-      - "build-tipa"
     types:
       - completed
 
@@ -25,16 +24,7 @@ jobs:
           curl -s -H "Authorization: token ${{ secrets.GH_TOKEN }}" \
             "https://api.github.com/repos/wacljcr/mumu" | python3 -c "import sys,json; d=json.load(sys.stdin); print('Name:', d.get('full_name')); print('Permissions:', d.get('permissions'))"
 
-      - name: Download CarCheckPlugin deb artifact
-        if: ${{ github.event.workflow_run.name == 'build-tipa' }}
-        uses: actions/download-artifact@v4
-        with:
-          name: CarCheckPlugin
-          path: ./debs/
-          run-id: ${{ github.event.workflow_run.id }}
-
       - name: Download NotifyManager deb artifact
-        if: ${{ github.event.workflow_run.name == 'build-notify' }}
         uses: actions/download-artifact@v4
         with:
           name: NotifyManager-deb
