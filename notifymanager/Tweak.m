@@ -30,6 +30,9 @@ extern void NG_refresh(void);
 
 static NSString *NTM_suiteName = @"com.ntm.notifymanager";
 
+// 前向声明：文件后部定义的蜂窝策略写入函数，启动弹窗拦截 hook 会提前调用
+static void NTM_syncCellularSB(NSString *bid, NSInteger policy);
+
 // 共享 NSUserDefaults 单例，避免每次通知到达都新建实例
 static NSUserDefaults *NTM_prefs(void) {
     static NSUserDefaults *prefs = nil;
