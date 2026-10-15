@@ -1,6 +1,6 @@
 Package: com.ntm.notifymanager
 Name: 通知管理
-Version: 2.3.32
+Version: 2.3.33
 Architecture: iphoneos-arm64
 Maintainer: yzdmm2024
 Author: yzdmm2024
@@ -9,4 +9,5 @@ Description: 通知管理：注入SpringBoard拦截通知展示，按分类(用�
  2.3.30 iOS 16+系统级授权弹窗彻底拦截：①修复策略缓存写入API——旧版只尝试 init:withCellularPolicy:andWifiPolicy: 单一方法，iOS 16+ 上该 API 不存在导致策略写入静默失败，现尝试多种可能的 policiesFor/init/setPolicy 方法名并加诊断日志，定位失败原因；②iOS 16+ 无线数据权限弹窗不走通知系统 dispatchUserNotification（旧 API），走 SpringBoard 内部的 _UISystemAlertViewController / SBAuthorizationDialogController / _UIAlertControllerDialogViewController，新增这些类的 showWithCompletion: hook，统一检测"无线数据/蜂窝数据/使用数据/访问数据/无线局域网与蜂窝网络"关键词；③兜底 hook UIViewController presentViewController:animated:completion:，检测 UIAlertController 的 title+message+actions 文本，覆盖所有通过 present API 展示的网络授权弹窗；④新增 NTM_diagLog 诊断日志，所有 hook 触发和策略写入结果写入 NSUserDefaults，便于定位为什么弹窗仍漏出。
  2.3.31 弹窗兜底彻底修复：2.3.30 的兜底 hook 用了错误 selector（presentViewControllerAnimated:completion: 缺第一个冒号），导致 UIViewController 兜底根本没装上，且只从 alert title 提取 App 名（该弹窗 title 为「错误」、权限文本在 message），无法解析 bundle id，新安装 App 仍会弹「允许使用无线数据」选择框；现修正 selector 为 presentViewController:animated:completion:，并从 title+message+actions 完整文本提取 App 名，新安装 App 联网自动写入 allow 策略并不弹窗。
  2.3.32 弹窗拦截再加固：2.3.31 兜底 hook 虽已命中弹窗，但「中文 App 名 → bundle id」解析在部分 App（本地化名与弹窗名存在 NFC/NFKC 归一差异）上失败，仍回退到系统原生弹窗；现新增两道兜底——①规范化中文名（去空白+预组合）并兼容 displayName 后再匹配 LSApplicationWorkspace，②实在解析不到时用前台 App 的 bundle id 兜底（网络授权弹窗由前台 App 触发）；并新增源头拦截 SBAlertItemsController -_presentAlertItem:withPresenter:animated:，在 alert controller 构建前直接拿到 SBUserNotificationAlert、不再依赖 UIAlertController 类层级，命中网络授权关键词即写入 allow 策略并吞掉弹窗；所有分支均带 NTM_diagLog，可在面板诊断日志查看命中情况。
+ 2.3.33 弹窗彻底修复（换思路）：2.3.31/2.3.32 在 UIAlertController / SBAlertItemsController 层面吞弹窗，实测会掐断 CommCenter 的 replyPort 回包、导致该 App 联网卡死，且「已配置就回退弹窗」逻辑让新 App 仍弹出；现改为唯一可靠处理点——hook SBUserNotificationCenter +dispatchUserNotification:flags:replyPort:auditToken:（弹窗源头，CommCenter 经此把请求发给 SpringBoard 并等待 replyPort 回包，正是 2.3.21 断网 App 成功压住弹窗的同一机制），命中网络授权关键词后：断网/后台断网 App 回「不允许」报文，非断网 App（含新安装未配置）回「允许」报文并写入系统蜂窝 allow 策略，弹窗在源头被消解、不再上屏，且不会卡联网；purepresentVC/presentAlertItem 降级为仅诊断记录（不可吞，避免卡死）；init 日志记录三道 hook 是否真正装上，便于定位漏拦。
 Depends: mobilesubstrate (>= 0.9.5000), preferenceloader

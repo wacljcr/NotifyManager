@@ -613,45 +613,55 @@ static void NTM_syncCellularSB(NSString *bid, NSInteger policy);
 static void (*orig_dispatch)(id, SEL, id, uint64_t, uint64_t, void *);
 static void hook_dispatch(id self, SEL _cmd, id msg, uint64_t flags,
                           uint64_t replyPort, void *auditToken) {
-    // 先确认是不是 CommCenter 的无线数据弹窗
+    // 这道是「允许使用无线数据」弹窗的唯一可靠处理点：
+    // 在源头给 CommCenter 回 allow/deny 报文，既压住弹窗又不会掐断回包导致 App 联网卡死。
     @try {
-        NSString *src = [msg objectForKey:@"AlertSource"];
-        if (![src isEqualToString:@"CommCenter"]) {
-            if (orig_dispatch) orig_dispatch(self, _cmd, msg, flags, replyPort, auditToken);
-            return;
+        // 组装全部文本字段用于网络授权关键词匹配（标题可能在 AlertTitle/AlertHeader/AlertBody 任一）
+        NSMutableString *fullText = [NSMutableString string];
+        NSArray *keys = @[@"AlertSource", @"AlertHeader", @"AlertTitle", @"AlertBody",
+                         @"AlertText", @"AlertMessage", @"Title", @"Message"];
+        for (NSString *k in keys) {
+            id v = [msg objectForKey:k];
+            if ([v isKindOfClass:[NSString class]] && [v length]) [fullText appendFormat:@" %@", v];
         }
-        NSString *hdr = [msg objectForKey:@"AlertHeader"] ?: @"";
-        NSString *body = [msg objectForKey:@"AlertBody"] ?: [msg objectForKey:@"AlertText"] ?: @"";
-        NSString *fullText = [NSString stringWithFormat:@"%@ %@", hdr, body];
-        // 匹配各种中文变体：无线数据 / 蜂窝数据 / 数据访问
+        // 匹配各种中文变体：无线数据 / 蜂窝数据 / 使用数据 / 访问数据
         BOOL isNetAlert = [fullText containsString:@"无线数据"] ||
                           [fullText containsString:@"蜂窝数据"] ||
                           [fullText containsString:@"使用数据"] ||
-                          [fullText containsString:@"访问数据"];
+                          [fullText containsString:@"访问数据"] ||
+                          [fullText containsString:@"无线局域网与蜂窝网络"];
         if (!isNetAlert) {
             if (orig_dispatch) orig_dispatch(self, _cmd, msg, flags, replyPort, auditToken);
             return;
         }
-        // 优先用 auditToken 提取 bundle id（最可靠）
-        NSString *bid = NTM_bundleIdFromAuditToken(auditToken);
-        // 回退：从弹窗文本解析 App 名 → bundle id
-        if (!bid.length) {
-            NSString *appName = NTM_appNameOfHeader(fullText);
-            if (appName.length) bid = NTM_bundleIdOfName(appName);
-        }
-        if (!bid.length) {
-            if (orig_dispatch) orig_dispatch(self, _cmd, msg, flags, replyPort, auditToken);
+        // 网络授权弹窗：白名单式放行，永远不要让系统把选择框弹出来
+        NTM_diagLog([NSString stringWithFormat:@"dispatch NETALERT src=%@ text=%@",
+                     [msg objectForKey:@"AlertSource"], fullText]);
+        // 解析目标 App 的 bundle id（多路兜底，越靠后越兜底）
+        NSString *bid = NTM_bundleIdFromAuditToken(auditToken);           // 1) auditToken（最可靠）
+        if (!bid.length) bid = NTM_bundleIdOfName([msg objectForKey:@"AlertHeader"]); // 2) AlertHeader 即 App 原名
+        if (!bid.length) bid = NTM_bundleIdOfName(NTM_extractNetAuthAppName(fullText)); // 3) 从「允许X使用无线数据」提取
+        if (!bid.length) bid = NTM_frontmostBundleId();                   // 4) 前台 App 即发起网络请求的 App
+        NSInteger net = bid.length ? NTM_netRead(bid) : 0;
+        BOOL bgNet = bid.length ? NTM_bgNetOn(bid) : NO;
+        if (net == 1 || bgNet) {
+            // 面板设为断网 / 后台断网 → 回 deny 报文（等同点「不允许」），压住弹窗
+            NTM_diagLog([NSString stringWithFormat:@"dispatch DENY bid=%@", bid]);
+            NTM_sendDenyReply(replyPort);
             return;
         }
-        NSInteger net = NTM_netRead(bid);
-        BOOL bgNet = NTM_bgNetOn(bid);
-        if (net == 1 || bgNet) { NTM_sendDenyReply(replyPort); return; }
-        if (!NTM_isAppConfigured(bid)) {
-            NTM_syncCellularSB(bid, 0); // 新安装 App 写入 allow 策略
-            NTM_sendAllowReply(replyPort);
-            return;
+        // 非断网：新安装 App 写 allow 策略；已配置 App 直接放行；一律回 allow 报文，不让弹窗出现
+        if (bid.length && !NTM_isAppConfigured(bid)) {
+            NTM_syncCellularSB(bid, 0); // 写系统蜂窝策略（wifi+流量允许）
+            NTM_diagLog([NSString stringWithFormat:@"dispatch ALLOW+write bid=%@", bid]);
+        } else {
+            NTM_diagLog([NSString stringWithFormat:@"dispatch ALLOW bid=%@", bid]);
         }
-    } @catch (NSException *e) {}
+        NTM_sendAllowReply(replyPort);
+        return;
+    } @catch (NSException *e) {
+        NTM_diagLog([NSString stringWithFormat:@"dispatch EXC %@", e.reason]);
+    }
     if (orig_dispatch) orig_dispatch(self, _cmd, msg, flags, replyPort, auditToken);
 }
 
@@ -839,25 +849,10 @@ static void hook_presentVC(id self, SEL _cmd, id toPresent, BOOL animated, id co
             }
             NSString *full = [text copy];
             if (NTM_isNetAuthPopup(full)) {
-                NTM_diagLog([NSString stringWithFormat:@"presentVC INTERCEPT title=%@ message=%@", ac.title, ac.message]);
-                // 2.3.32: 综合解析 bundle id（名字规范化 + 前台 App 兜底）
-                NSString *bid = NTM_resolveNetAlertBundleId(full);
-                if (!bid.length) {
-                    // 仍解析不到：宁可吞掉弹窗（不展示）也不要回退到系统弹窗
-                    NTM_diagLog([NSString stringWithFormat:@"presentVC NO bid -> suppress title=%@ message=%@", ac.title, ac.message]);
-                    return;
-                }
-                NSInteger net = NTM_netRead(bid);
-                BOOL bgNet = NTM_bgNetOn(bid);
-                if (net == 1 || bgNet) {
-                    NTM_diagLog([NSString stringWithFormat:@"presentVC DENY bid=%@", bid]);
-                    return;
-                }
-                if (!NTM_isAppConfigured(bid)) {
-                    NTM_syncCellularSB(bid, 0);
-                    NTM_diagLog([NSString stringWithFormat:@"presentVC ALLOW+write bid=%@", bid]);
-                    return;
-                }
+                // 网络授权弹窗走到了展示阶段：说明源头 dispatch 没拦住（理论上不该发生）。
+                // 这里【不能】直接 return 吞掉——那样会掐断 CommCenter 回包、导致该 App 联网卡死。
+                // 只能记录诊断并放行，让用户仍能点选。
+                NTM_diagLog([NSString stringWithFormat:@"presentVC REACHED(MISS) title=%@ message=%@", ac.title, ac.message]);
             }
         }
     } @catch(NSException *e) {
@@ -881,26 +876,12 @@ static void hook_presentAlertItem(id self, SEL _cmd, id item, id presenter, BOOL
             if (orig_presentAlertItem) orig_presentAlertItem(self, _cmd, item, presenter, animated);
             return;
         }
-        NTM_diagLog([NSString stringWithFormat:@"presentAlertItem NETALERT item=%@ text=%@",
+        // 网络授权弹窗走到展示阶段：源头 dispatch 没拦住时的诊断记录。
+        // 同样【不能】吞掉——会掐断 CommCenter 回包导致该 App 联网卡死。放行，让用户点选。
+        NTM_diagLog([NSString stringWithFormat:@"presentAlertItem REACHED(MISS) item=%@ text=%@",
                      NSStringFromClass([item class]), text]);
-        NSString *bid = NTM_resolveNetAlertBundleId(text);
-        if (!bid.length) {
-            // 兜底也解析不到：吞掉弹窗，避免回退到系统弹窗（宁可少弹，不误放）
-            NTM_diagLog(@"presentAlertItem NO bid -> suppress (fallback failed)");
-            return;
-        }
-        NSInteger net = NTM_netRead(bid);
-        BOOL bgNet = NTM_bgNetOn(bid);
-        if (net == 1 || bgNet) {
-            NTM_diagLog([NSString stringWithFormat:@"presentAlertItem DENY bid=%@", bid]);
-            return;
-        }
-        if (!NTM_isAppConfigured(bid)) {
-            NTM_syncCellularSB(bid, 0); // 新安装 App 写 allow 策略
-            NTM_diagLog([NSString stringWithFormat:@"presentAlertItem ALLOW+write bid=%@", bid]);
-            return;
-        }
         if (orig_presentAlertItem) orig_presentAlertItem(self, _cmd, item, presenter, animated);
+        return;
     } @catch (NSException *e) {
         NTM_diagLog([NSString stringWithFormat:@"presentAlertItem EXC %@", e.reason]);
         if (orig_presentAlertItem) orig_presentAlertItem(self, _cmd, item, presenter, animated);
@@ -1281,9 +1262,11 @@ __attribute__((constructor)) static void init() {
                 sel_registerName("_presentAlertItem:withPresenter:animated:"),
                 (IMP)hook_presentAlertItem, (IMP *)&orig_presentAlertItem);
 
-        // 诊断日志：记录 init 完成
+        // 诊断日志：记录 init 完成 + 关键 hook 是否装上（dispatch 是网络弹窗的唯一可靠处理点）
         if (NTM_isSpringBoard()) {
-            NTM_diagLog(@"init DONE v2.3.32");
+            NTM_diagLog([NSString stringWithFormat:
+                @"init DONE v2.3.33 hooks: dispatch=%d presentAlertItem=%d presentVC=%d",
+                (orig_dispatch != NULL), (orig_presentAlertItem != NULL), (orig_presentVC != NULL)]);
         }
     }
 }
