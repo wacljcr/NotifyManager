@@ -1,8 +1,11 @@
 name: Update Cydia Repo
 
-# 2.3.37.1 构建期间临时禁用（用户要求本次不推送越狱源），构建完成后恢复原 workflow_run 触发
 on:
-  workflow_dispatch:
+  workflow_run:
+    workflows:
+      - "build-notify"
+    types:
+      - completed
 
 jobs:
   update-repo:
