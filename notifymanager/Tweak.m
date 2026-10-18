@@ -44,6 +44,7 @@ static NSUserDefaults *NTM_prefs(void) {
 }
 
 // ===== 2.3.37.1 新增：网络弹窗全局开关（设置面板「设置」页可配）=====
+id NTM_prefObject(NSString *key); // 定义见文件后部（镜像优先读取），此处前向声明
 // NTM_hideNetPopup：隐藏网络弹窗总开关。默认开=维持历来"不弹「允许XX使用无线数据」"的行为；
 // 关=所有网络弹窗 hook 直接放行，完全恢复系统原生选择框。
 static BOOL NTM_hideNetPopupOn(void) {
