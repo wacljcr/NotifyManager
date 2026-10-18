@@ -1,6 +1,6 @@
 Package: com.ntm.notifymanager
 Name: 通知管理
-Version: 2.3.37
+Version: 2.3.37.1
 Architecture: iphoneos-arm64
 Maintainer: yzdmm2024
 Author: yzdmm2024
@@ -12,4 +12,5 @@ Description: 通知管理：注入SpringBoard拦截通知展示，按分类(用�
  2.3.33 弹窗彻底修复（换思路）：2.3.31/2.3.32 在 UIAlertController / SBAlertItemsController 层面吞弹窗，实测会掐断 CommCenter 的 replyPort 回包、导致该 App 联网卡死，且「已配置就回退弹窗」逻辑让新 App 仍弹出；现改为唯一可靠处理点——hook SBUserNotificationCenter +dispatchUserNotification:flags:replyPort:auditToken:（弹窗源头，CommCenter 经此把请求发给 SpringBoard 并等待 replyPort 回包，正是 2.3.21 断网 App 成功压住弹窗的同一机制），命中网络授权关键词后：断网/后台断网 App 回「不允许」报文，非断网 App（含新安装未配置）回「允许」报文并写入系统蜂窝 allow 策略，弹窗在源头被消解、不再上屏，且不会卡联网；purepresentVC/presentAlertItem 降级为仅诊断记录（不可吞，避免卡死）；init 日志记录三道 hook 是否真正装上，便于定位漏拦。
  2.3.34 修「不弹窗但没网」：2.3.33 源头拦截虽压住了弹窗，但非断网 App 没真正拿到「无线局域网与蜂窝网络」——根因是 dispatch 里 bundle id 四路兜底全失败、策略写入被 `if(bid.length && !NTM_isAppConfigured)` 跳过，只发了一条（且很可能没送达的）allow 回包，CommCenter 超时按拒绝处理 → 没网；现修正：①audit_token PID 偏移读错（旧代码用 t32[4]=at_asid 会话ID，应为 t32[3]=at_pid），auditToken 这条路现在能直接定位触发弹窗的 App 进程并取 bundle id；②前台 App 兜底扩充 SBMainWorkspace 等类与选择器；③dispatch 里无条件为非断网 App 写 allow 策略（不再被「已配置」跳过），并重构解析顺序为 auditToken→前台→文本提取，每步打 NTM_diagLog；④NTM_sendReply 记录 mach_msg 返回值 kr，便于确认回包是否真送达。
  2.3.35 修「不弹窗但没网」（换对拦截点）：实测本机 iOS 16.6 网络授权弹窗根本不走 SBUserNotificationCenter +dispatchUserNotification:flags:replyPort:auditToken:（该 selector 在本机不存在，2.3.33/2.3.34 的源头 hook 是死代码、永不触发）；真正压弹窗的是 2.3.19 就装上的 SBApplicationLaunchAlertEvaluatorForNetworkBasedAlertItems -shouldShowLaunchAlertForApplication: 与 SBApplicationLaunchAlertService -showLaunchAlertOfType:forApplication:，这两道只「压弹窗」却从不「授权」，导致新 App 联网被卡（没网）。现改为：在这两道 hook 里，对面板未配置的新 App 直接调用 NTM_syncCellularSB(bid,0) 写系统蜂窝 allow 策略（wifi+流量允许）再 return，既压住弹窗又真正授权；断网/后台断网 App 仍压弹窗不授权。各分支均打 NTM_diagLog（launchEval ALLOW+write / launchShow ALLOW+write），可在面板诊断日志确认命中。
+ 2.3.37.1 设置页改版：①顶部原「自定义」按钮改为「设置」入口，新增设置页集中三个全局开关——隐藏网络弹窗（默认开，关=所有网络弹窗 hook 放行、恢复系统原生「允许XX使用无线数据」选择框；面板里断网/后台断网的 App 仍不弹窗）、保留首次安装弹窗（默认关，开=面板未配置的新装 App 首次打开时仍走系统原生流程弹选择框，允许/不允许由用户自己决定；开启时 SpringBoard 不再为未配置 App 预写 allow 策略，否则策略已允许系统不会再弹）、自动授权通知（抹除后免弹窗，从主页迁入设置页）；②设置页另保留「恢复自定义配置」按钮=原「自定义」按钮功能（撤销上次全部开启/关闭批量操作）；③所有开关改动即时经 configChanged 广播生效，无需重启。
 Depends: mobilesubstrate (>= 0.9.5000), preferenceloader

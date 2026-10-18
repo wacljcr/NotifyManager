@@ -3,7 +3,9 @@
 // 每个 App：总开关 + 锁定屏幕/通知中心/横幅/声音/标记 子开关 + 单应用重置
 // 增强功能：仅隐藏角标 / 隐藏预览 / 后台自动断网 / 关键词过滤 / 分组
 // 网络策略按钮：打开wifi/流量/wifi+流量/断网
-// 顶部：模式快照 / 应用分组；批量开启/关闭/自定义；筛选；搜索
+// 顶部：批量开启/关闭/设置；模式快照 / 应用分组；筛选；搜索
+// 「设置」页（2.3.37.1，原「自定义」按钮改为设置入口）：隐藏网络弹窗 / 保留首次安装弹窗 /
+// 自动授权通知（抹除后免弹窗）/ 恢复自定义配置（原自定义按钮功能）
 // 列表使用 UITableView 虚拟化，切换分类/搜索即时响应
 // 配置保存到 NSUserDefaults suiteName，Tweak 读取并拦截通知/断网
 // 设置变更时同步到系统通知设置 (BBSettingsGateway) 与蜂窝网络 (PSAppDataUsagePolicyCache)
@@ -34,6 +36,12 @@ static NSArray *NTM_allApps(void);
 @end
 
 @interface NTMPrincipalController : PSViewController <UISearchBarDelegate, UIDocumentPickerDelegate, UITableViewDelegate, UITableViewDataSource>
+@end
+
+// 2.3.37.1 设置页（实现见文件底部）：原「自定义」按钮改为「设置」入口后的全局开关页
+@interface NTMSettingsController : UIViewController
+@property (nonatomic, copy) void (^onRestoreCustom)(void);
+- (void)closeTapped;
 @end
 
 #pragma mark - 存储: NSUserDefaults suiteName (Tweak 读取同一份)
@@ -884,7 +892,6 @@ static UIButton *NTM_actionTag(NSString *text, UIColor *color) {
     UIStackView *_editRow3; // 网络策略
     BOOL _editing;          // 是否多选批量模式
     NSMutableSet *_selected; // 多选模式下选中的 appId
-    UISwitch *_autoAuthSwitch; // 全局：自动授权通知权限
 }
 
 - (void)setRootController:(id)rootController {}
@@ -939,11 +946,20 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
     });
 }
 
-- (void)autoAuthChanged {
-    [NTM_prefs() setBool:_autoAuthSwitch.on forKey:@"NTM_autoAuth"];
-    [NTM_prefs() synchronize];
-    NTM_postConfigChanged();
-    [self toast:_autoAuthSwitch.on ? @"已开启：打开 App 不再弹通知授权框" : @"已关闭自动授权"];
+- (void)settingsTapped {
+    NTMSettingsController *sc = [[NTMSettingsController alloc] init];
+    __weak NTMPrincipalController *wself = self;
+    // 「恢复自定义配置」= 原「自定义」按钮的功能（撤销上次全部开启/关闭，回到操作前的配置）
+    sc.onRestoreCustom = ^{ [wself customTapped]; };
+    if (self.navigationController) {
+        [self.navigationController pushViewController:sc animated:YES];
+    } else {
+        UINavigationController *nav = [[UINavigationController alloc] initWithRootViewController:sc];
+        sc.navigationItem.leftBarButtonItem = [[UIBarButtonItem alloc] initWithTitle:@"关闭"
+                                                                              style:UIBarButtonItemStylePlain
+                                                                             target:sc action:@selector(closeTapped)];
+        [self presentViewController:nav animated:YES completion:nil];
+    }
 }
 
 - (void)buildUI {
@@ -976,10 +992,11 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
         [UIColor colorWithRed:0.87 green:0.24 blue:0.24 alpha:0.15],
         [UIColor colorWithRed:0.72 green:0.17 blue:0.17 alpha:1]);
     [allOffBtn addTarget:self action:@selector(allOffTapped) forControlEvents:UIControlEventTouchUpInside];
-    UIButton *customBtn = NTM_pillButton(@"自定义",
+    // 2.3.37.1：原「自定义」按钮改为「设置」入口，全局开关收进设置页
+    UIButton *settingsBtn = NTM_pillButton(@"设置",
         [UIColor colorWithRed:0.55 green:0.58 blue:0.65 alpha:0.18],
         [UIColor colorWithWhite:0.35 alpha:1]);
-    [customBtn addTarget:self action:@selector(customTapped) forControlEvents:UIControlEventTouchUpInside];
+    [settingsBtn addTarget:self action:@selector(settingsTapped) forControlEvents:UIControlEventTouchUpInside];
 
     // 多选模式：三行批量操作（选择/通知声音 / 增强子项 / 网络）
     UIButton *cancelBtn = NTM_pillButton(@"取消",
@@ -1081,8 +1098,8 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
         [UIColor colorWithRed:0.15 green:0.45 blue:0.78 alpha:1]);
     [grpBtn addTarget:self action:@selector(groupManagerTapped) forControlEvents:UIControlEventTouchUpInside];
 
-    // 顶部一行：全部开启/关闭 + 自定义 + 模式快照 + 应用分组（多选入口统一用分类栏右侧"全选"）
-    _topRow = [[UIStackView alloc] initWithArrangedSubviews:@[allOnBtn, allOffBtn, customBtn, snapBtn, grpBtn]];
+    // 顶部一行：全部开启/关闭 + 设置 + 模式快照 + 应用分组（多选入口统一用分类栏右侧"全选"）
+    _topRow = [[UIStackView alloc] initWithArrangedSubviews:@[allOnBtn, allOffBtn, settingsBtn, snapBtn, grpBtn]];
     _topRow.axis = UILayoutConstraintAxisHorizontal;
     _topRow.distribution = UIStackViewDistributionFillEqually;
     _topRow.spacing = 5;
@@ -1122,27 +1139,10 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
         [UIColor colorWithRed:0.13 green:0.55 blue:0.24 alpha:1]);
     [importBtn addTarget:self action:@selector(importConfig) forControlEvents:UIControlEventTouchUpInside];
 
-    // 全局：自动授权通知权限（抹除手机设置后，按本插件配置静默授权，App 打开不再弹"想给你发送通知"）
-    _autoAuthSwitch = [[UISwitch alloc] init];
-    [_autoAuthSwitch addTarget:self action:@selector(autoAuthChanged) forControlEvents:UIControlEventValueChanged];
-    _autoAuthSwitch.on = ({ id _v = [NTM_prefs() objectForKey:@"NTM_autoAuth"]; _v ? [_v boolValue] : YES; }); // 默认开启
-    UILabel *aaLabel = [[UILabel alloc] init];
-    aaLabel.text = @"自动授权通知（抹除后免弹窗）";
-    aaLabel.font = [UIFont systemFontOfSize:14 weight:UIFontWeightMedium];
-    aaLabel.textColor = [UIColor colorWithWhite:0.2 alpha:1];
-    aaLabel.numberOfLines = 2;
-    UIStackView *aaRow = [[UIStackView alloc] initWithArrangedSubviews:@[aaLabel, _autoAuthSwitch]];
-    aaRow.axis = UILayoutConstraintAxisHorizontal;
-    aaRow.alignment = UIStackViewAlignmentCenter;
-    aaRow.spacing = 10;
-    aaRow.layoutMargins = UIEdgeInsetsMake(10, 14, 10, 14);
-    aaRow.layoutMarginsRelativeArrangement = YES;
-    aaRow.backgroundColor = [UIColor whiteColor];
-    aaRow.layer.cornerRadius = 14;
-    [aaRow.heightAnchor constraintEqualToConstant:52].active = YES;
+    // 2.3.37.1：自动授权通知开关已移至「设置」页（见文件底部 NTMSettingsController）
 
     // 顶部行 + 多选批量栏 做成纵向栈，停用/启用时靠 hidden 自动折叠展开
-    _headCol = [[UIStackView alloc] initWithArrangedSubviews:@[aaRow, _topRow, _editCol]];
+    _headCol = [[UIStackView alloc] initWithArrangedSubviews:@[_topRow, _editCol]];
     _headCol.axis = UILayoutConstraintAxisVertical;
     _headCol.spacing = 6;
 
@@ -1935,6 +1935,173 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
 }
 
 #pragma mark - Toast
+- (void)toast:(NSString *)msg {
+    UILabel *l = [[UILabel alloc] init];
+    l.text = msg;
+    l.font = [UIFont systemFontOfSize:13];
+    l.textColor = [UIColor whiteColor];
+    l.backgroundColor = [UIColor colorWithWhite:0 alpha:0.78];
+    l.layer.cornerRadius = 10;
+    l.clipsToBounds = YES;
+    l.textAlignment = NSTextAlignmentCenter;
+    l.numberOfLines = 0;
+    l.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:l];
+    [NSLayoutConstraint activateConstraints:@[
+        [l.centerXAnchor constraintEqualToAnchor:self.view.centerXAnchor],
+        [l.centerYAnchor constraintEqualToAnchor:self.view.centerYAnchor],
+        [l.leadingAnchor constraintGreaterThanOrEqualToAnchor:self.view.leadingAnchor constant:30],
+        [l.trailingAnchor constraintLessThanOrEqualToAnchor:self.view.trailingAnchor constant:-30],
+    ]];
+    l.alpha = 0;
+    [UIView animateWithDuration:0.2 animations:^{ l.alpha = 1; }];
+    dispatch_after(dispatch_time(DISPATCH_TIME_NOW, (int64_t)(2.2 * NSEC_PER_SEC)), dispatch_get_main_queue(), ^{
+        [UIView animateWithDuration:0.3 animations:^{ l.alpha = 0; } completion:^(BOOL f){ [l removeFromSuperview]; }];
+    });
+}
+
+@end
+
+#pragma mark - 设置页（2.3.37.1 新增：原「自定义」按钮改为「设置」入口）
+// 集中三个全局开关（写 NSUserDefaults suite，Tweak.m 读取）：
+//   隐藏网络弹窗      NTM_hideNetPopup       默认开（关=恢复系统原生网络选择框）
+//   保留首次安装弹窗  NTM_keepFirstLaunchPopup 默认关（开=新装 App 首次打开仍弹选择框）
+//   自动授权通知      NTM_autoAuth           默认开（从主页迁入，抹除后免弹窗）
+// 另有「恢复自定义配置」= 原「自定义」按钮功能（撤销上次全部开启/关闭批量操作）。
+@implementation NTMSettingsController {
+    UISwitch *_hideNetPopupSwitch;
+    UISwitch *_keepFirstPopupSwitch;
+    UISwitch *_autoAuthSwitch;
+}
+
+- (void)closeTapped { [self dismissViewControllerAnimated:YES completion:nil]; }
+
+// 一行开关：标题 + 副标题 + UISwitch；开关对象通过 outSw 回传
+- (UIView *)switchRowWithTitle:(NSString *)title
+                      subtitle:(NSString *)subtitle
+                           key:(NSString *)key
+                           def:(BOOL)def
+                        target:(id)target action:(SEL)action
+                      switchOut:(UISwitch **)outSw {
+    UILabel *t = [[UILabel alloc] init];
+    t.text = title;
+    t.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    t.textColor = [UIColor colorWithWhite:0.15 alpha:1];
+    UILabel *s = [[UILabel alloc] init];
+    s.text = subtitle;
+    s.font = [UIFont systemFontOfSize:11];
+    s.textColor = [UIColor colorWithWhite:0.5 alpha:1];
+    s.numberOfLines = 0;
+    UIStackView *labels = [[UIStackView alloc] initWithArrangedSubviews:@[t, s]];
+    labels.axis = UILayoutConstraintAxisVertical;
+    labels.spacing = 3;
+    UISwitch *sw = [[UISwitch alloc] init];
+    [sw addTarget:target action:action forControlEvents:UIControlEventValueChanged];
+    id v = [NTM_prefs() objectForKey:key];
+    sw.on = v ? [v boolValue] : def;
+    if (outSw) *outSw = sw;
+    UIStackView *row = [[UIStackView alloc] initWithArrangedSubviews:@[labels, sw]];
+    row.axis = UILayoutConstraintAxisHorizontal;
+    row.alignment = UIStackViewAlignmentCenter;
+    row.spacing = 10;
+    row.layoutMargins = UIEdgeInsetsMake(10, 14, 10, 14);
+    row.layoutMarginsRelativeArrangement = YES;
+    row.backgroundColor = [UIColor whiteColor];
+    row.layer.cornerRadius = 14;
+    [row.heightAnchor constraintGreaterThanOrEqualToConstant:64].active = YES;
+    return row;
+}
+
+- (void)viewDidLoad {
+    [super viewDidLoad];
+    self.title = @"设置";
+    self.overrideUserInterfaceStyle = UIUserInterfaceStyleLight;
+    self.view.backgroundColor = [UIColor colorWithRed:0.95 green:0.96 blue:0.98 alpha:1];
+
+    UILabel *header = [[UILabel alloc] init];
+    header.text = @"全局开关";
+    header.font = [UIFont systemFontOfSize:13 weight:UIFontWeightMedium];
+    header.textColor = [UIColor colorWithWhite:0.4 alpha:1];
+
+    UIView *r1 = [self switchRowWithTitle:@"隐藏网络弹窗"
+                                 subtitle:@"关闭后恢复系统原生的「允许\"XX\"使用无线数据」选择框（面板里断网/后台断网的 App 仍不弹窗）"
+                                    key:@"NTM_hideNetPopup" def:YES
+                                 target:self action:@selector(hideNetPopupChanged:)
+                               switchOut:&_hideNetPopupSwitch];
+    UIView *r2 = [self switchRowWithTitle:@"保留首次安装弹窗"
+                                 subtitle:@"新装 App 首次打开时仍弹出网络选择框，允许/不允许由你自己决定（关闭则自动允许联网）"
+                                    key:@"NTM_keepFirstLaunchPopup" def:NO
+                                 target:self action:@selector(keepFirstPopupChanged:)
+                               switchOut:&_keepFirstPopupSwitch];
+    UIView *r3 = [self switchRowWithTitle:@"自动授权通知（抹除后免弹窗）"
+                                 subtitle:@"抹除/还原设置后，按插件配置静默授权，打开 App 不再弹「想给你发送通知」"
+                                    key:@"NTM_autoAuth" def:YES
+                                 target:self action:@selector(autoAuthChanged:)
+                               switchOut:&_autoAuthSwitch];
+
+    // 恢复自定义配置（原「自定义」按钮功能）
+    UILabel *rt = [[UILabel alloc] init];
+    rt.text = @"恢复自定义配置";
+    rt.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
+    rt.textColor = [UIColor colorWithWhite:0.15 alpha:1];
+    UILabel *rs = [[UILabel alloc] init];
+    rs.text = @"撤销上次「全部开启 / 全部关闭」批量操作，回到操作前的配置";
+    rs.font = [UIFont systemFontOfSize:11];
+    rs.textColor = [UIColor colorWithWhite:0.5 alpha:1];
+    rs.numberOfLines = 0;
+    UIButton *restoreBtn = NTM_pillButton(@"恢复自定义配置",
+        [UIColor colorWithRed:0.45 green:0.62 blue:0.98 alpha:0.16],
+        [UIColor colorWithRed:0.16 green:0.38 blue:0.78 alpha:1]);
+    [restoreBtn addTarget:self action:@selector(restoreCustomTapped) forControlEvents:UIControlEventTouchUpInside];
+    UIStackView *restoreCard = [[UIStackView alloc] initWithArrangedSubviews:@[rt, rs, restoreBtn]];
+    restoreCard.axis = UILayoutConstraintAxisVertical;
+    restoreCard.spacing = 8;
+    restoreCard.layoutMargins = UIEdgeInsetsMake(12, 14, 12, 14);
+    restoreCard.layoutMarginsRelativeArrangement = YES;
+    restoreCard.backgroundColor = [UIColor whiteColor];
+    restoreCard.layer.cornerRadius = 14;
+
+    UILabel *ver = [[UILabel alloc] init];
+    ver.text = @"NotifyManager 2.3.37.1";
+    ver.font = [UIFont systemFontOfSize:11];
+    ver.textColor = [UIColor colorWithWhite:0.45 alpha:1];
+    ver.textAlignment = NSTextAlignmentCenter;
+
+    UIStackView *col = [[UIStackView alloc] initWithArrangedSubviews:@[header, r1, r2, r3, restoreCard, ver]];
+    col.axis = UILayoutConstraintAxisVertical;
+    col.spacing = 10;
+    col.translatesAutoresizingMaskIntoConstraints = NO;
+    [self.view addSubview:col];
+    [NSLayoutConstraint activateConstraints:@[
+        [col.topAnchor constraintEqualToAnchor:self.view.safeAreaLayoutGuide.topAnchor constant:16],
+        [col.leadingAnchor constraintEqualToAnchor:self.view.leadingAnchor constant:16],
+        [col.trailingAnchor constraintEqualToAnchor:self.view.trailingAnchor constant:-16],
+    ]];
+}
+
+- (void)hideNetPopupChanged:(UISwitch *)sw {
+    [NTM_prefs() setBool:sw.on forKey:@"NTM_hideNetPopup"];
+    [NTM_prefs() synchronize];
+    NTM_postConfigChanged();
+    [self toast:sw.on ? @"已开启：不弹网络选择框" : @"已关闭：恢复系统原生网络弹窗"];
+}
+- (void)keepFirstPopupChanged:(UISwitch *)sw {
+    [NTM_prefs() setBool:sw.on forKey:@"NTM_keepFirstLaunchPopup"];
+    [NTM_prefs() synchronize];
+    NTM_postConfigChanged();
+    [self toast:sw.on ? @"已开启：新装 App 首次打开仍弹网络选择框" : @"已关闭：新装 App 自动允许联网"];
+}
+- (void)autoAuthChanged:(UISwitch *)sw {
+    [NTM_prefs() setBool:sw.on forKey:@"NTM_autoAuth"];
+    [NTM_prefs() synchronize];
+    NTM_postConfigChanged();
+    [self toast:sw.on ? @"已开启：打开 App 不再弹通知授权框" : @"已关闭自动授权"];
+}
+- (void)restoreCustomTapped {
+    if (_onRestoreCustom) _onRestoreCustom();
+    [self toast:@"已恢复自定义配置"];
+}
+
 - (void)toast:(NSString *)msg {
     UILabel *l = [[UILabel alloc] init];
     l.text = msg;

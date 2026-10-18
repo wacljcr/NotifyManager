@@ -43,6 +43,20 @@ static NSUserDefaults *NTM_prefs(void) {
     return prefs;
 }
 
+// ===== 2.3.37.1 新增：网络弹窗全局开关（设置面板「设置」页可配）=====
+// NTM_hideNetPopup：隐藏网络弹窗总开关。默认开=维持历来"不弹「允许XX使用无线数据」"的行为；
+// 关=所有网络弹窗 hook 直接放行，完全恢复系统原生选择框。
+static BOOL NTM_hideNetPopupOn(void) {
+    id v = NTM_prefObject(@"NTM_hideNetPopup");
+    return v ? [v boolValue] : YES;
+}
+// NTM_keepFirstLaunchPopup：保留首次安装弹窗。默认关=新装 App 自动写 allow 策略不弹窗（历来行为）；
+// 开=面板未配置的新装 App 首次打开时仍走系统原生流程，弹选择框由用户自己选允许/不允许。
+static BOOL NTM_keepFirstLaunchPopupOn(void) {
+    id v = NTM_prefObject(@"NTM_keepFirstLaunchPopup");
+    return v ? [v boolValue] : NO;
+}
+
 // ===== 2.3.30 新增：诊断日志 =====
 // 用户可通过 Settings → 面板 查看 hook 触发记录，定位为什么弹窗仍出现。
 // 存到 NSUserDefaults suite，最多保留 50 条。
@@ -420,6 +434,11 @@ static NSUInteger hook_shouldShowLaunchAlert(id self, SEL _cmd, id app) {
         if (orig_shouldShowLaunchAlert) return orig_shouldShowLaunchAlert(self, _cmd, app);
         return 0;
     }
+    // 2.3.37.1：设置里关掉「隐藏网络弹窗」→ 完全恢复系统原生行为
+    if (!NTM_hideNetPopupOn()) {
+        if (orig_shouldShowLaunchAlert) return orig_shouldShowLaunchAlert(self, _cmd, app);
+        return 0;
+    }
     NSInteger net = NTM_netRead(bid);
     BOOL bgNet = NTM_bgNetOn(bid);
     // 断网 / 后台断网 → 不展示（和原来一致）
@@ -429,6 +448,13 @@ static NSUInteger hook_shouldShowLaunchAlert(id self, SEL _cmd, id app) {
     }
     // 面板已配置且非断网 → 让系统走原始逻辑（蜂窝策略已由面板写入系统）
     if (NTM_isAppConfigured(bid)) {
+        if (orig_shouldShowLaunchAlert) return orig_shouldShowLaunchAlert(self, _cmd, app);
+        return 0;
+    }
+    // 2.3.37.1：设置里开「保留首次安装弹窗」→ 面板未配置的新装 App 走系统原生流程，
+    // 弹出「允许使用无线数据？」选择框，允许/不允许由用户自己决定
+    if (NTM_keepFirstLaunchPopupOn()) {
+        NTM_diagLog([NSString stringWithFormat:@"launchEval KEEP-FIRST bid=%@", bid]);
         if (orig_shouldShowLaunchAlert) return orig_shouldShowLaunchAlert(self, _cmd, app);
         return 0;
     }
@@ -447,6 +473,11 @@ static void hook_showLaunchAlert(id self, SEL _cmd, NSUInteger type, id app) {
         if (orig_showLaunchAlert) orig_showLaunchAlert(self, _cmd, type, app);
         return;
     }
+    // 2.3.37.1：设置里关掉「隐藏网络弹窗」→ 完全恢复系统原生行为
+    if (!NTM_hideNetPopupOn()) {
+        if (orig_showLaunchAlert) orig_showLaunchAlert(self, _cmd, type, app);
+        return;
+    }
     NSInteger net = NTM_netRead(bid);
     BOOL bgNet = NTM_bgNetOn(bid);
     if (net == 1 || bgNet) {
@@ -454,6 +485,12 @@ static void hook_showLaunchAlert(id self, SEL _cmd, NSUInteger type, id app) {
         return;
     }
     if (NTM_isAppConfigured(bid)) {
+        if (orig_showLaunchAlert) orig_showLaunchAlert(self, _cmd, type, app);
+        return;
+    }
+    // 2.3.37.1：保留首次安装弹窗开启 → 新装 App 走系统原生流程，弹选择框由用户自己选
+    if (NTM_keepFirstLaunchPopupOn()) {
+        NTM_diagLog([NSString stringWithFormat:@"launchShow KEEP-FIRST bid=%@ type=%lu", bid, (unsigned long)type]);
         if (orig_showLaunchAlert) orig_showLaunchAlert(self, _cmd, type, app);
         return;
     }
@@ -645,6 +682,11 @@ static NSString *NTM_frontmostBundleId(void);
 static void (*orig_dispatch)(id, SEL, id, uint64_t, uint64_t, void *);
 static void hook_dispatch(id self, SEL _cmd, id msg, uint64_t flags,
                           uint64_t replyPort, void *auditToken) {
+    // 2.3.37.1：设置里关掉「隐藏网络弹窗」→ 完全放行系统原生流程
+    if (!NTM_hideNetPopupOn()) {
+        if (orig_dispatch) orig_dispatch(self, _cmd, msg, flags, replyPort, auditToken);
+        return;
+    }
     // 这道是「允许使用无线数据」弹窗的唯一可靠处理点：
     // 在源头给 CommCenter 回 allow/deny 报文，既压住弹窗又不会掐断回包导致 App 联网卡死。
     @try {
@@ -685,6 +727,13 @@ static void hook_dispatch(id self, SEL _cmd, id msg, uint64_t flags,
             // 面板设为断网 / 后台断网 → 回 deny 报文（等同点「不允许」），压住弹窗
             NTM_diagLog([NSString stringWithFormat:@"dispatch DENY bid=%@", bid]);
             NTM_sendDenyReply(replyPort);
+            return;
+        }
+        // 2.3.37.1：保留首次安装弹窗开启 → 面板未配置的新装 App 走系统原生流程，
+        // 让 CommCenter 正常创建「允许使用无线数据？」选择框（用户自选，不替它决定）
+        if (bid.length && !NTM_isAppConfigured(bid) && NTM_keepFirstLaunchPopupOn()) {
+            NTM_diagLog([NSString stringWithFormat:@"dispatch KEEP-FIRST bid=%@", bid]);
+            if (orig_dispatch) orig_dispatch(self, _cmd, msg, flags, replyPort, auditToken);
             return;
         }
         // 非断网：无论是否「已配置」，都无条件写 allow 策略（wifi+流量允许），并回 allow 报文，
@@ -822,6 +871,11 @@ static NSString *NTM_resolveNetAlertBundleId(NSString *text) {
 // 用于 _UISystemAlertViewController showWithCompletion: 和 SBAuthorizationDialogController showWithCompletion:
 static void (*orig_showAlertCompletion)(id, SEL, id);
 static void hook_showAlertCompletion(id self, SEL _cmd, id completion) {
+    // 2.3.37.1：设置里关掉「隐藏网络弹窗」→ 完全放行系统原生弹窗
+    if (!NTM_hideNetPopupOn()) {
+        if (orig_showAlertCompletion) orig_showAlertCompletion(self, _cmd, completion);
+        return;
+    }
     NSString *text = nil, *info = nil;
     @try { text = [self valueForKey:@"text"]; } @catch(NSException *e) {}
     @try { info = [self valueForKey:@"informativeText"]; } @catch(NSException *e) {}
@@ -860,6 +914,12 @@ static void hook_showAlertCompletion(id self, SEL _cmd, id completion) {
         return; // 断网 → 不展示
     }
     if (!NTM_isAppConfigured(bid)) {
+        // 2.3.37.1：保留首次安装弹窗开启 → 新 App 放行系统弹窗，由用户自己选允许/不允许
+        if (NTM_keepFirstLaunchPopupOn()) {
+            NTM_diagLog([NSString stringWithFormat:@"netAuth KEEP-FIRST bid=%@", bid]);
+            if (orig_showAlertCompletion) orig_showAlertCompletion(self, _cmd, completion);
+            return;
+        }
         NTM_syncCellularSB(bid, 0); // 新 App 写入 allow 策略
         NTM_diagLog([NSString stringWithFormat:@"netAuth ALLOW+write bid=%@", bid]);
         return; // 写入策略后也不展示（策略已允许）
@@ -1121,6 +1181,12 @@ static void NTM_syncCellularSB(NSString *appId, NSInteger policy) {
 // 系统策略缓存 allow（WiFi+蜂窝），后续联网不再弹窗、不再无网。
 // 跳过 com.apple.* 系统 App（它们有自己的策略，不该被覆盖）。
 static void NTM_writeAllowPoliciesForUnconfiguredApps(NSDictionary *cfg) {
+    // 2.3.37.1：设置里开「保留首次安装弹窗」时，不给未配置 App 预写 allow 策略——
+    // 否则策略缓存里已是"允许"，系统不会再弹选择框，开关就失效了。
+    if (NTM_keepFirstLaunchPopupOn()) {
+        NTM_diagLog(@"writeAllowUnconfigured SKIP keepFirstLaunchPopup=ON");
+        return;
+    }
     NSMutableSet *configured = [NSMutableSet set];
     for (NSString *k in cfg) {
         if ([k hasPrefix:@"NTM_net_"]) {
@@ -1204,7 +1270,10 @@ __attribute__((constructor)) static void init() {
                        NTM_mirrorQueue(), ^{ NTM_writeMirrors(); NTM_applyAllPolicies(); });
 
         // 自动授权通知默认开启：保证重装/抹除后打开 App 不再弹授权框（面板可手动关）
-        [NTM_prefs() registerDefaults:@{@"NTM_autoAuth": @YES}];
+        // 2.3.37.1：新增两个网络弹窗全局开关的默认值（隐藏网络弹窗=开，保留首次安装弹窗=关）
+        [NTM_prefs() registerDefaults:@{@"NTM_autoAuth": @YES,
+                                        @"NTM_hideNetPopup": @YES,
+                                        @"NTM_keepFirstLaunchPopup": @NO}];
 
         // 总开关 + 关键词过滤 + 隐藏预览
         tryHook(objc_getClass("NCNotificationDispatcher"),
@@ -1306,7 +1375,7 @@ __attribute__((constructor)) static void init() {
         // 诊断日志：记录 init 完成 + 关键 hook 是否装上
         if (NTM_isSpringBoard()) {
             NTM_diagLog([NSString stringWithFormat:
-                @"init DONE v2.3.35 hooks: launchEval=%d launchShow=%d dispatch=%d presentAlertItem=%d presentVC=%d",
+                @"init DONE v2.3.37.1 hooks: launchEval=%d launchShow=%d dispatch=%d presentAlertItem=%d presentVC=%d",
                 (orig_shouldShowLaunchAlert != NULL), (orig_showLaunchAlert != NULL),
                 (orig_dispatch != NULL), (orig_presentAlertItem != NULL), (orig_presentVC != NULL)]);
         }
