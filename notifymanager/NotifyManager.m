@@ -1982,7 +1982,7 @@ static UIButton *NTM_pillButton(NSString *title, UIColor *bg, UIColor *fg) {
                            key:(NSString *)key
                            def:(BOOL)def
                         target:(id)target action:(SEL)action
-                      switchOut:(UISwitch **)outSw {
+                      switchOut:(UISwitch *__strong *)outSw {
     UILabel *t = [[UILabel alloc] init];
     t.text = title;
     t.font = [UIFont systemFontOfSize:15 weight:UIFontWeightMedium];
