@@ -437,8 +437,10 @@ static NSArray *NTM_allApps(void) {
         if (!bid.length || !path.length) continue;
         NSString *cat = NTM_catOfProxy(proxy);
         if ([cat isEqualToString:@"系统应用"]) {
+            // 2.3.39: 放开 NTM_hasNotifications 过滤——此前 Safari/相机/指南针等未在系统通知中心登记的
+            // 系统应用会被这行挡掉、面板里看不到也无法管理(尤其断网后只能在系统蜂窝救回)。
+            // 现只按 /Applications 路径判定，所有 com.apple.* 系统应用均显示并可管理。
             if (![path hasPrefix:@"/Applications/"]) continue;
-            if (!NTM_hasNotifications(bid)) continue;
         }
         // 获取安装时间（用于"最近"过滤）
         NSDate *installDate = nil;

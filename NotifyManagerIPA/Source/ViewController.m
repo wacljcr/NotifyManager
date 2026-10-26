@@ -210,14 +210,16 @@ static NSArray *kCategories(void) {
 
 - (NSSet *)_systemAppKeepList {
     // 只保留这些系统应用，其余过滤掉
+    // 注：测距仪/放大器的真实 bundle id 为 com.apple.measure / com.apple.Magnifier
+    //     （原仓库写的 measurify / magnifier 是错的，会导致这两个 App 被过滤掉、面板里看不到）
     return [NSSet setWithArray:@[
         @"com.apple.mobilenotes",          // 备忘录
         @"com.apple.podcasts",             // 播客
-        @"com.apple.measurify",            // 测距仪
+        @"com.apple.measure",              // 测距仪（修正：原 measurify 拼写错误）
         @"com.apple.findmy",               // 查找
         @"com.apple.Maps",                 // 地图
         @"com.apple.Translate",            // 翻译
-        @"com.apple.magnifier",            // 放大器
+        @"com.apple.Magnifier",            // 放大器（修正：原 magnifier 大小写错误）
         @"com.apple.mobilephone",          // FaceTime通话
         @"com.apple.stocks",               // 股市
         @"com.apple.calculator",           // 计算器
@@ -240,6 +242,15 @@ static NSArray *kCategories(void) {
         @"com.apple.Music",                // 音乐
         @"com.apple.mobilemail",           // 邮件
         @"com.apple.VoiceMemos",           // 语音备忘录
+
+        // -- 新增：用户反馈需要管理的系统应用（断网生效走系统蜂窝策略，面板必须可见才能改回）--
+        @"com.apple.mobilesafari",         // Safari浏览器（曾因被过滤、断网后只能在系统蜂窝里救回）
+        @"com.apple.MobileSMS",            // 信息
+        @"com.apple.facetime",             // FaceTime
+        @"com.apple.mobileslideshow",      // 照片
+        @"com.apple.compass",              // 指南针
+        @"com.apple.camera",               // 相机
+        @"com.apple.AppStore",             // App Store
     ]];
 }
 
