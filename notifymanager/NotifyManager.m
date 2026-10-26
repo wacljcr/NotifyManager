@@ -392,6 +392,54 @@ static BOOL NTM_hasNotifications(NSString *appId) {
     if (!s.count) return YES;
     return [s containsObject:appId];
 }
+// 2.3.52 系统应用白名单（去噪）。只显示这些真正可管理的系统应用，
+// 过滤掉 100+ 系统守护进程/扩展/隐藏工具等无开关可管的噪音项（2.3.51 放开后有 147 个）。
+// 含 Safari/相机/指南针/信息/FaceTime/照片/App Store 等需被控项；测距仪/放大器用正确 Bundle ID。
+static NSSet *NTM_systemKeepSet(void) {
+    static NSSet *set;
+    static dispatch_once_t once;
+    dispatch_once(&once, ^{
+        set = [NSSet setWithArray:@[
+            @"com.apple.mobilenotes",          // 备忘录
+            @"com.apple.podcasts",             // 播客
+            @"com.apple.measure",              // 测距仪
+            @"com.apple.findmy",               // 查找
+            @"com.apple.Maps",                 // 地图
+            @"com.apple.Translate",            // 翻译
+            @"com.apple.Magnifier",            // 放大器
+            @"com.apple.mobilephone",          // 电话/FaceTime
+            @"com.apple.stocks",               // 股市
+            @"com.apple.calculator",           // 计算器
+            @"com.apple.Home",                 // 家庭
+            @"com.apple.Health",               // 健康
+            @"com.apple.Fitness",              // 健身
+            @"com.apple.shortcuts",            // 快捷指令
+            @"com.apple.Passbook",             // 钱包
+            @"com.apple.mobilecal",            // 日历
+            @"com.apple.mobiletimer",          // 时钟
+            @"com.apple.tv",                   // 视频
+            @"com.apple.tips",                 // 提示
+            @"com.apple.reminders",            // 提醒事项
+            @"com.apple.weather",              // 天气
+            @"com.apple.MobileAddressBook",    // 通讯录
+            @"com.apple.iBooks",               // 图书
+            @"com.apple.DocumentsApp",         // 文件
+            @"com.apple.freeform",             // 无边记
+            @"com.apple.Bridge",               // Watch
+            @"com.apple.Music",                // 音乐
+            @"com.apple.mobilemail",           // 邮件
+            @"com.apple.VoiceMemos",           // 语音备忘录
+            @"com.apple.mobilesafari",         // Safari浏览器
+            @"com.apple.MobileSMS",            // 信息
+            @"com.apple.facetime",             // FaceTime
+            @"com.apple.mobileslideshow",      // 照片
+            @"com.apple.compass",              // 指南针
+            @"com.apple.camera",               // 相机
+            @"com.apple.AppStore",             // App Store
+        ]];
+    });
+    return set;
+}
 
 #pragma mark - 枚举 App (LSApplicationWorkspace)
 static NSString *NTM_catOfProxy(id proxy) {
@@ -437,10 +485,14 @@ static NSArray *NTM_allApps(void) {
         if (!bid.length || !path.length) continue;
         NSString *cat = NTM_catOfProxy(proxy);
         if ([cat isEqualToString:@"系统应用"]) {
-            // 2.3.39: 放开 NTM_hasNotifications 过滤——此前 Safari/相机/指南针等未在系统通知中心登记的
-            // 系统应用会被这行挡掉、面板里看不到也无法管理(尤其断网后只能在系统蜂窝救回)。
-            // 现只按 /Applications 路径判定，所有 com.apple.* 系统应用均显示并可管理。
             if (![path hasPrefix:@"/Applications/"]) continue;
+            // 2.3.52 去噪：只显示白名单内、或已在系统通知中心登记过的系统应用，
+            // 避免把 100+ 系统守护进程/扩展/隐藏工具列出来（2.3.51 放开后有 147 个）。
+            // 白名单已含 Safari/相机/指南针/信息/FaceTime/照片/App Store 等需被控项。
+            BOOL inKeep = [NTM_systemKeepSet() containsObject:bid];
+            NSSet *ns = NTM_notifSet();
+            BOOL inNotif = (ns.count > 0 && [ns containsObject:bid]);
+            if (!inKeep && !inNotif) continue;
         }
         // 获取安装时间（用于"最近"过滤）
         NSDate *installDate = nil;
