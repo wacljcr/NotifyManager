@@ -193,6 +193,17 @@ static BOOL NTM_shouldBlock(NSString *appId, NSString *dim) {
 static NSString *NTM_sectionOf(id request) {
     if (!request) return nil;
     NSString *sectionId = nil;
+    // 0) 优先从 section 拿真实 bundleId，与面板（NotifyManager.m 以 bundleId 为 key 写入）对齐。
+    //    修复闲鱼等「通知 sectionIdentifier ≠ 主 bundleId」的 App 开关失效（开关像假的）问题。
+    @try {
+        if ([request respondsToSelector:@selector(section)]) {
+            id sec = [request section];
+            if (sec && [sec respondsToSelector:@selector(bundleIdentifier)]) {
+                NSString *bid = [sec bundleIdentifier];
+                if (bid.length) return bid;
+            }
+        }
+    } @catch(NSException *e) {}
     // 1) 直接 sectionIdentifier（绝大多数 App 返回 bundleId）
     @try { sectionId = [request performSelector:@selector(sectionIdentifier)]; } @catch(NSException *e) {}
     if (sectionId.length) return sectionId;
