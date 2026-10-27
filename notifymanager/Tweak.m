@@ -193,21 +193,11 @@ static BOOL NTM_shouldBlock(NSString *appId, NSString *dim) {
 static NSString *NTM_sectionOf(id request) {
     if (!request) return nil;
     NSString *sectionId = nil;
-    // 0) 优先从 section 拿真实 bundleId，与面板（NotifyManager.m 以 bundleId 为 key 写入）对齐。
-    //    修复闲鱼等「通知 sectionIdentifier ≠ 主 bundleId」的 App 开关失效（开关像假的）问题。
-    @try {
-        if ([request respondsToSelector:@selector(section)]) {
-            id sec = [request performSelector:@selector(section)];
-            if (sec && [sec respondsToSelector:@selector(bundleIdentifier)]) {
-                NSString *bid = [sec bundleIdentifier];
-                if (bid.length) return bid;
-            }
-        }
-    } @catch(NSException *e) {}
-    // 1) 直接 sectionIdentifier（绝大多数 App 返回 bundleId）
+    // 直接 sectionIdentifier（绝大多数 App 返回 bundleId，与面板写入 key 对齐；
+    // 真机实测 2.3.54 的 request.section().bundleIdentifier() 恒为空，已移除）
     @try { sectionId = [request performSelector:@selector(sectionIdentifier)]; } @catch(NSException *e) {}
     if (sectionId.length) return sectionId;
-    // 2) 部分 iOS 版 request 包了一层 BBBulletin，section 在 bulletin 上
+    // 1) 部分 iOS 版 request 包了一层 BBBulletin，section 在 bulletin 上
     @try {
         id bulletin = [request performSelector:@selector(bulletin)];
         if (bulletin) {
@@ -216,7 +206,7 @@ static NSString *NTM_sectionOf(id request) {
         }
     } @catch(NSException *e) {}
     if (sectionId.length) return sectionId;
-    // 3) content 兜底（极端情况）
+    // 2) content 兜底（极端情况）
     @try {
         id content = [request performSelector:@selector(content)];
         if (content) @try { sectionId = [content performSelector:@selector(sectionIdentifier)]; } @catch(NSException *e) {}
@@ -286,14 +276,6 @@ static void (*orig_postRequest)(id, SEL, id);
 static void hook_postRequest(id self, SEL _cmd, id request) {
     NSString *sectionId = NTM_sectionOf(request);
     if (sectionId.length) {
-        // 诊断（仅 SpringBoard，2.3.53 临时打开）：记录每条通知的真实 section + 总开关判定，
-        // 用于定位「开了通知却不显示 / 开关像假的」问题。NTM_diagLog 自带 50 条裁剪。
-        if (NTM_isSpringBoard()) {
-            BOOL kwHit = (NTM_matchKeyword(sectionId, request) != nil);
-            BOOL enOn = NTM_on(sectionId, @"en");
-            NTM_diagLog([NSString stringWithFormat:@"post %@ kw=%d en=%d -> %@",
-                         sectionId, kwHit, enOn, (kwHit || !enOn) ? @"DROP" : @"PASS"]);
-        }
         // 关键词过滤：优先于总开关（命中即丢弃该条）
         if (NTM_matchKeyword(sectionId, request)) return;
         if (!NTM_on(sectionId, @"en")) return; // 总开关关闭 → 拦截整个通知
