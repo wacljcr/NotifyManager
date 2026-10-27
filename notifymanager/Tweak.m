@@ -197,7 +197,7 @@ static NSString *NTM_sectionOf(id request) {
     //    修复闲鱼等「通知 sectionIdentifier ≠ 主 bundleId」的 App 开关失效（开关像假的）问题。
     @try {
         if ([request respondsToSelector:@selector(section)]) {
-            id sec = [request section];
+            id sec = [request performSelector:@selector(section)];
             if (sec && [sec respondsToSelector:@selector(bundleIdentifier)]) {
                 NSString *bid = [sec bundleIdentifier];
                 if (bid.length) return bid;
